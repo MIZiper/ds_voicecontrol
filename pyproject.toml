@@ -1,0 +1,44 @@
+[project]
+name = "ds-voicecontrol"
+version = "0.1.0"
+description = "本地语音控制工具：唤醒词唤醒 -> 离线语音识别 -> 口令匹配 -> 系统快捷键/操作"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "ds_voicecontrol" }]
+keywords = ["voice", "asr", "vosk", "wake-word", "hotkey", "automation"]
+dependencies = [
+    "sounddevice>=0.4.6",
+    "numpy>=1.24",
+    "vosk>=0.3.44",
+    "tomlkit>=0.12.3",
+    "pynput>=1.7.6",
+]
+
+[project.optional-dependencies]
+# 更准的识别引擎（可选）：uv sync --extra whisper
+whisper = ["faster-whisper>=1.0.3"]
+
+[project.scripts]
+vc = "voice_control.cli:main"
+
+[project.urls]
+Homepage = "https://example.invalid/ds_voicecontrol"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/voice_control"]
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[tool.uv]
+# vosk 依赖的 srt（仅用于 vosk 的字幕命令行工具）在 PyPI 上只有源码包，
+# 安装时 setuptools 会在本地构建它。这是正常的，uv sync 会自动处理。
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
