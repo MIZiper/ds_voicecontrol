@@ -22,7 +22,19 @@ from .config_default import DEFAULT_CONFIG_TOML
 DEFAULT_CONFIG_NAME = "config.toml"
 ENV_CONFIG_PATH = "VC_CONFIG"
 
-ACTION_TYPES = ("hotkey", "press", "text", "app", "focus", "wait", "sequence", "shell")
+ACTION_TYPES = (
+    "hotkey",
+    "press",
+    "text",
+    "app",
+    "url",
+    "focus",
+    "click",
+    "seek",
+    "wait",
+    "sequence",
+    "shell",
+)
 ACTION_FIELDS = (
     "type",
     "keys",
@@ -36,6 +48,12 @@ ACTION_FIELDS = (
     "ms",
     "steps",
     "shell",
+    "x",
+    "y",
+    "button",
+    "count",
+    "slot",
+    "seconds",
 )
 UNKNOWN_MODES = ("log", "ignore", "beep")
 LOG_LEVELS = ("debug", "info", "warning", "error")
@@ -161,6 +179,19 @@ class Rule:
             detail = repr(action.get("text", ""))
         elif kind == "app":
             detail = str(action.get("target", ""))
+        elif kind == "url":
+            detail = str(action.get("target", ""))
+        elif kind == "click":
+            detail = f"({action.get('x', '?')}, {action.get('y', '?')}) {action.get('button', 'left')}"
+            try:
+                count = int(action.get("count", 1) or 1)
+            except (TypeError, ValueError):
+                count = 1
+            if count > 1:
+                detail += f" x{count}"
+        elif kind == "seek":
+            slot = str(action.get("slot", "") or "").strip()
+            detail = f"跳到 {slot} 槽位里的时间" if slot else f"跳到第 {action.get('seconds')} 秒"
         elif kind == "focus":
             detail = f"激活窗口 {action.get('title', '')!r}"
         elif kind == "wait":
@@ -191,6 +222,21 @@ class Rule:
         elif kind == "app":
             if not str(self.action.get("target", "")).strip():
                 issues.append("缺少 target")
+        elif kind == "url":
+            if not str(self.action.get("target", "")).strip():
+                issues.append('缺少 target（例如 target = "{url}"）')
+        elif kind == "click":
+            for axis in ("x", "y"):
+                try:
+                    float(self.action.get(axis))
+                except (TypeError, ValueError):
+                    issues.append(f"click 需要数字 {axis}（屏幕坐标，先用 `vc pos` 量一下）")
+            button = str(self.action.get("button", "left") or "left").strip().lower()
+            if button not in ("left", "right", "middle"):
+                issues.append("click 的 button 只能是 left/right/middle")
+        elif kind == "seek":
+            if not str(self.action.get("slot", "")).strip() and "seconds" not in self.action:
+                issues.append("seek 需要 slot（槽位名）或 seconds（秒数）")
         elif kind == "focus":
             if not str(self.action.get("title", "")).strip():
                 issues.append("缺少 title")

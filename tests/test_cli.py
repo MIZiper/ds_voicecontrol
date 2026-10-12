@@ -153,6 +153,8 @@ def test_all_subcommands_have_help(capsys) -> None:
         "wake",
         "rules",
         "keytest",
+        "pos",
+        "click",
         "doctor",
         "say",
         "run",

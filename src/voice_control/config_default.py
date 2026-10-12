@@ -94,7 +94,7 @@ save_audio_dir = ""
 [commands]
 # 允许执行的动作类型白名单：
 #   hotkey / press / text / app / focus / wait / sequence / shell
-allow = ["hotkey", "press", "text", "app", "focus", "wait", "sequence"]
+allow = ["hotkey", "press", "text", "app", "url", "focus", "click", "seek", "wait", "sequence"]
 # 是否允许执行 shell 命令（默认关闭；开启前请确认规则里没有危险命令）
 allow_shell = false
 # 大模型没匹配到命令、或调用失败时：log（打印）| ignore（静默）| beep（响一声）
@@ -127,7 +127,10 @@ beep = true
 #    type = "press"     keys = ["enter"]                    依次按键，可加 repeat / interval_ms
 #    type = "text"      text = "你好{query}"                 输入文字，支持 {槽位} {text} {date} {time}
 #    type = "app"       target = "notepad" / "https://..."   打开程序、文件或网址
+#    type = "url"       target = "{url}"                     打开网址（域名自动补 https://）
 #    type = "focus"     title = "记事本"                     把指定窗口切到前台
+#    type = "click"     x = 1850  y = 60                     在屏幕坐标点击（button / count）
+#    type = "seek"      slot = "sec"                         跳到网页视频第 N 秒（bilibili/YouTube）
 #    type = "wait"      ms = 500                             等待
 #    type = "sequence"  steps = [ {...}, {...} ]              组合动作
 #    type = "shell"     command = "..."                      执行命令（需 allow_shell = true）
@@ -245,6 +248,16 @@ phrases = ["打开记事本", "记事本"]
 type = "app"
 target = "notepad"
 
+# 打开网站：模型把网站名转成主域名放进 url 槽位，本动作会自动补上 https://
+[[rules]]
+id = "open_site"
+name = "打开网站"
+description = "打开用户说出的网站。用户说“打开/上某个网站”时用这条：把网站名转成主域名或完整网址放进 url 槽位，例如 B站→bilibili.com、百度→baidu.com、知乎→zhihu.com、淘宝→taobao.com、GitHub→github.com；用户直接给了链接就填完整链接"
+phrases = ["打开百度", "打开b站", "打开知乎", "上github", "打开淘宝"]
+slots = ["url"]
+type = "url"
+target = "{url}"
+
 # ---- 浏览器 / 应用内 ----
 # “搜索 今天天气”：模型会把“今天天气”放进 query 槽位
 [[rules]]
@@ -277,20 +290,116 @@ type = "hotkey"
 keys = ["ctrl", "w"]
 
 [[rules]]
+id = "tab_next"
+name = "下一个标签页"
+description = "切换到浏览器右边（下一个）的标签页（Ctrl+Tab）"
+phrases = ["下一个标签页", "下一个标签", "切到下一个标签页", "下个标签"]
+type = "hotkey"
+keys = ["ctrl", "tab"]
+
+[[rules]]
+id = "tab_prev"
+name = "上一个标签页"
+description = "切换到浏览器左边（上一个）的标签页（Ctrl+Shift+Tab）"
+phrases = ["上一个标签页", "上一个标签", "切到上一个标签页", "上个标签"]
+type = "hotkey"
+keys = ["ctrl", "shift", "tab"]
+
+[[rules]]
 id = "page_down"
-name = "下一页"
-description = "向下翻一页"
-phrases = ["下一页", "往下翻"]
+name = "向下滚动一屏"
+description = "把当前页面往下滚动一屏（相当于 PageDown 键）。用户说“往下翻/向下滚”时用这条"
+phrases = ["向下翻页", "往下翻", "向下滚", "滚下去"]
 type = "press"
 keys = ["pagedown"]
 
 [[rules]]
 id = "page_up"
-name = "上一页"
-description = "向上翻一页"
-phrases = ["上一页", "往上翻"]
+name = "向上滚动一屏"
+description = "把当前页面往上滚动一屏（相当于 PageUp 键）"
+phrases = ["向上翻页", "往上翻", "向上滚", "滚上去"]
 type = "press"
 keys = ["pageup"]
+
+# 浏览器历史前进 / 后退（Alt+← / Alt+→）
+[[rules]]
+id = "page_back"
+name = "返回上一个网页"
+description = "浏览器后退，回到上一个看过的网页（相当于 Alt+左方向键）"
+phrases = ["返回上一页", "回到上一页", "后退", "退回上一个网页", "上一个页面"]
+type = "hotkey"
+keys = ["alt", "left"]
+
+[[rules]]
+id = "page_forward"
+name = "前进到下一个网页"
+description = "浏览器前进，回到刚才后退之前的那个网页（相当于 Alt+右方向键）"
+phrases = ["前进", "下一个页面", "回到刚才那个网页", "前进到下一个"]
+type = "hotkey"
+keys = ["alt", "right"]
+
+# ---- 网页视频（bilibili / YouTube 等）----
+# 视频还没开始播放时，系统媒体键是无效的（浏览器还没接管媒体会话），这时用空格。
+[[rules]]
+id = "web_play_pause"
+name = "网页视频播放/暂停"
+description = "用空格控制网页播放器的播放/暂停。用户说“空格”“网页播放”“网页暂停”，或者系统播放/暂停键没反应时用这条"
+phrases = ["空格", "空格播放", "网页播放", "网页暂停", "网页播放暂停"]
+type = "press"
+keys = ["space"]
+
+# 跳到几分几秒：bilibili / YouTube 支持网址里的 t=秒数 精确定位。
+# 做法是选中地址栏 → 复制 → 改写 t= → 回车，所以页面会重新加载一次。
+[[rules]]
+id = "bili_seek"
+name = "跳到指定时间"
+description = "跳到当前网页视频的第几分几秒（bilibili/YouTube）。把时间换算成总秒数放进 sec 槽位：3分20秒→200，1分半→90，1小时2分→3720"
+phrases = ["跳到三分二十秒", "跳到12分", "跳到两分钟", "跳到一小时"]
+slots = ["sec"]
+type = "seek"
+slot = "sec"
+
+# bilibili 原生倍速快捷键：Shift+1 = 原速，Shift+2 = 2 倍速
+[[rules]]
+id = "bili_speed_1x"
+name = "原速播放"
+description = "bilibili 播放器切回 1 倍速（原生快捷键 Shift+1）"
+phrases = ["原速", "正常速度", "一倍速", "恢复正常速度"]
+type = "hotkey"
+keys = ["shift", "1"]
+
+[[rules]]
+id = "bili_speed_2x"
+name = "二倍速播放"
+description = "bilibili 播放器切到 2 倍速（原生快捷键 Shift+2）"
+phrases = ["二倍速", "两倍速", "加速播放", "二倍速播放"]
+type = "hotkey"
+keys = ["shift", "2"]
+
+# 全屏：播放器全屏 = F（bilibili/YouTube 原生），浏览器全屏 = F11，退出 = Esc
+[[rules]]
+id = "fullscreen_toggle"
+name = "全屏切换"
+description = "切换网页播放器的全屏（bilibili/YouTube 原生 F 键）。进全屏、退全屏都用这一条"
+phrases = ["全屏", "全屏播放", "全屏切换", "进入全屏"]
+type = "hotkey"
+keys = ["f"]
+
+[[rules]]
+id = "fullscreen_browser"
+name = "浏览器全屏"
+description = "切换浏览器自身的全屏（F11，连地址栏和标签栏一起隐藏）"
+phrases = ["浏览器全屏", "网页全屏", "f11全屏"]
+type = "hotkey"
+keys = ["f11"]
+
+[[rules]]
+id = "exit_fullscreen"
+name = "退出全屏"
+description = "退出全屏状态（Esc；播放器全屏和浏览器全屏都认）"
+phrases = ["退出全屏", "取消全屏", "退出播放器全屏"]
+type = "hotkey"
+keys = ["esc"]
 
 # ---- 音量 / 媒体 ----
 [[rules]]
@@ -345,4 +454,35 @@ keys = ["playpause"]
 # phrases = ["锁屏"]
 # type = "shell"
 # command = "rundll32.exe user32.dll,LockWorkStation"
+
+# ---- 模拟点击（坐标要自己量）----
+# 把鼠标移到目标按钮上，用 `uv run vc pos` 读出屏幕坐标，再填进 x / y。
+# 窗口模式和全屏模式下按钮位置不一样，所以各写一条规则。
+# [[rules]]
+# id = "skip_ad"
+# name = "跳过广告"
+# description = "点击播放器右上角的跳过广告按钮"
+# phrases = ["跳过广告", "关掉广告", "关广告"]
+# type = "click"
+# x = 1850
+# y = 60
+#
+# [[rules]]
+# id = "skip_ad_fullscreen"
+# name = "全屏跳过广告"
+# description = "全屏播放时点击右上角的跳过广告按钮"
+# phrases = ["全屏跳过广告", "全屏关广告"]
+# type = "click"
+# x = 1870
+# y = 40
+#
+# [[rules]]
+# id = "click_center_double"
+# name = "双击画面中间"
+# description = "在画面中间双击（例如全屏播放器里双击切换播放/暂停）"
+# phrases = ["双击一下"]
+# type = "click"
+# x = 960
+# y = 540
+# count = 2
 '''

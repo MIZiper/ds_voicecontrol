@@ -6,7 +6,10 @@
 * ``press``    依次按下的键，可重复（repeat / interval_ms）
 * ``text``     直接输入文字，支持槽位 ``{query}`` 和中文
 * ``app``      打开程序、文件或网址
+* ``url``      打开网址（域名自动补 https://，只允许 http/https）
 * ``focus``    把标题匹配的窗口切到前台（按键发错窗口时很有用）
+* ``click``    在屏幕坐标处模拟鼠标点击（x / y / button / count，坐标用 `vc pos` 测量）
+* ``seek``     跳到当前网页视频的第 N 秒（bilibili / YouTube：改写地址栏 ``t=`` 参数）
 * ``wait``     等待若干毫秒
 * ``shell``    执行命令行（默认被 commands.allow_shell = false 拦住）
 * ``sequence`` 组合动作，按顺序执行
@@ -29,6 +32,7 @@ import webbrowser
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from .config import ACTION_TYPES
 
@@ -116,6 +120,31 @@ KEYEVENTF_EXTENDEDKEY = 0x0001
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_UNICODE = 0x0004
 INPUT_KEYBOARD = 1
+
+# --- 鼠标 ------------------------------------------------------------------- #
+INPUT_MOUSE = 0
+MOUSEEVENTF_MOVE = 0x0001
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_RIGHTDOWN = 0x0008
+MOUSEEVENTF_RIGHTUP = 0x0010
+MOUSEEVENTF_MIDDLEDOWN = 0x0020
+MOUSEEVENTF_MIDDLEUP = 0x0040
+MOUSEEVENTF_ABSOLUTE = 0x8000
+MOUSEEVENTF_VIRTUALDESK = 0x4000
+
+MOUSE_BUTTONS: dict[str, tuple[int, int]] = {
+    "left": (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
+    "right": (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
+    "middle": (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
+}
+
+# GetSystemMetrics 的索引：虚拟屏幕（多显示器时可能是负数坐标）
+SM_XVIRTUALSCREEN = 76
+SM_YVIRTUALSCREEN = 77
+SM_CXVIRTUALSCREEN = 78
+SM_CYVIRTUALSCREEN = 79
+
 
 def known_key_names() -> list[str]:
     names = sorted(VK_CODES)
@@ -254,6 +283,52 @@ def _char_inputs(char: str, up: bool) -> list[_INPUT]:
     return [_INPUT(type=INPUT_KEYBOARD, u=_INPUTUNION(ki=_KEYBDINPUT(0, unit, flags, 0, None))) for unit in units]
 
 
+def _mouse_input(flags: int, dx: int = 0, dy: int = 0, data: int = 0) -> _INPUT:
+    return _INPUT(type=INPUT_MOUSE, u=_INPUTUNION(mi=_MOUSEINPUT(dx, dy, data, flags, 0, None)))
+
+
+def normalized_point(
+    x: float,
+    y: float,
+    left: int,
+    top: int,
+    width: int,
+    height: int,
+) -> tuple[int, int]:
+    """屏幕坐标 -> SendInput 要的 0~65535 绝对坐标（纯函数，方便单测）。
+
+    多显示器时 ``left``/``top`` 可能是负数，所以先减掉虚拟屏幕原点再按宽高归一化。
+    """
+    if width <= 1 or height <= 1:
+        return (0, 0)
+    nx = int(round((float(x) - float(left)) * 65535 / (width - 1)))
+    ny = int(round((float(y) - float(top)) * 65535 / (height - 1)))
+    return (max(0, min(65535, nx)), max(0, min(65535, ny)))
+
+
+def virtual_screen() -> tuple[int, int, int, int]:
+    """虚拟屏幕（含全部显示器）的 ``(left, top, width, height)``。"""
+    user32 = _user32()
+    return (
+        int(user32.GetSystemMetrics(SM_XVIRTUALSCREEN)),
+        int(user32.GetSystemMetrics(SM_YVIRTUALSCREEN)),
+        int(user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)),
+        int(user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)),
+    )
+
+
+def cursor_position() -> tuple[int, int]:
+    """当前鼠标位置（屏幕坐标），给 `vc pos` 量坐标用。"""
+    if os.name != "nt":  # pragma: no cover - 非 Windows 不做鼠标
+        raise ActionError("读取鼠标位置目前只支持 Windows")
+    from ctypes import wintypes
+
+    point = wintypes.POINT()
+    if not _user32().GetCursorPos(ctypes.byref(point)):
+        raise ActionError("读取鼠标位置失败")
+    return (int(point.x), int(point.y))
+
+
 def send_events(events: Sequence[_INPUT]) -> None:
     if not events:
         return
@@ -281,6 +356,234 @@ def send_events(events: Sequence[_INPUT]) -> None:
 
 class ActionError(RuntimeError):
     """动作无法执行时抛出。"""
+
+
+def click_at(
+    x: float,
+    y: float,
+    button: str = "left",
+    count: int = 1,
+    interval_ms: int = 60,
+) -> None:
+    """在屏幕坐标 ``(x, y)`` 处模拟鼠标点击（连点 ``count`` 次）。"""
+    if os.name != "nt":  # pragma: no cover - 非 Windows 不做鼠标
+        raise ActionError("模拟点击目前只支持 Windows")
+    name = str(button or "left").strip().lower()
+    if name not in MOUSE_BUTTONS:
+        raise ActionError(f"不认识的鼠标键 “{button}”。可用：{'/'.join(MOUSE_BUTTONS)}")
+    down, up = MOUSE_BUTTONS[name]
+    left, top, width, height = virtual_screen()
+    nx, ny = normalized_point(x, y, left, top, width, height)
+    move = _mouse_input(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK, nx, ny)
+    total = max(1, int(count))
+    for index in range(total):
+        if index:
+            time.sleep(max(0.0, float(interval_ms)) / 1000.0)
+        # 每次点击单独发一批：连点之间的间隔要够，否则会被当成一次点击
+        send_events([move, _mouse_input(down), _mouse_input(up)])
+
+
+# --------------------------------------------------------------------------- #
+# 网址 / 时间 / 剪贴板（url 与 seek 动作用）
+# --------------------------------------------------------------------------- #
+_SCHEME = re.compile(r"^([a-z][a-z0-9+.\-]*)://", re.IGNORECASE)
+# 只认 ASCII 域名：主机名 + 至少两位的顶级域，可带端口和路径
+_DOMAIN = re.compile(
+    r"^[a-z0-9](?:[a-z0-9\-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9\-]*[a-z0-9])?)*\.[a-z]{2,}(?::\d+)?(?:[/?#].*)?$",
+    re.IGNORECASE,
+)
+_TIME_UNITS = {"小时": 3600, "分钟": 60, "分": 60, "秒钟": 1, "秒": 1}
+_CN_DIGITS = {
+    "零": "0",
+    "一": "1",
+    "二": "2",
+    "两": "2",
+    "三": "3",
+    "四": "4",
+    "五": "5",
+    "六": "6",
+    "七": "7",
+    "八": "8",
+    "九": "9",
+}
+
+
+def normalize_url(value: str) -> str:
+    """把槽位里的域名补成完整网址（只接受 http/https）。"""
+    text = str(value or "").strip().strip("。，、,;；")
+    if not text:
+        raise ActionError("没有拿到要打开的网址（槽位是空的）")
+    scheme = _SCHEME.match(text)
+    if scheme:
+        if scheme.group(1).lower() not in ("http", "https"):
+            raise ActionError(f"只允许打开 http/https 网址，收到 “{text}”")
+        return text
+    if _DOMAIN.match(text):
+        return "https://" + text
+    raise ActionError(
+        f"“{text}” 不像网址。请在规则说明里让模型把网站名转成域名或完整链接"
+        "（例如 baidu.com、https://www.zhihu.com）"
+    )
+
+
+def normalize_time_text(text: str) -> str:
+    """把“三分二十秒”“一分半”这类中文写法换成阿拉伯数字，方便统一解析。"""
+    out = str(text or "")
+    for chinese, digit in _CN_DIGITS.items():
+        out = out.replace(chinese, digit)
+    # 十 / 十二 / 二十五 -> 10 / 12 / 25
+    out = re.sub(
+        r"([0-9]*)十([0-9]*)",
+        lambda match: str(
+            (int(match.group(1)) if match.group(1) else 1) * 10
+            + (int(match.group(2)) if match.group(2) else 0)
+        ),
+        out,
+    )
+    # “3分半” = 3.5 分；“1小时半” = 1.5 小时
+    out = re.sub(r"(\d+(?:\.\d+)?)\s*(小时|分钟|分)\s*半", r"\1.5\2", out)
+    return out
+
+
+def parse_seconds(value: Any) -> int:
+    """把 ``200`` / ``3:20`` / ``1:02:03`` / ``3分20秒`` / ``一分半`` 解析成秒数。"""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return max(0, int(round(float(value))))
+    text = normalize_time_text(str(value or "")).strip()
+    if not text:
+        raise ActionError("没有拿到时间（槽位是空的）")
+    if re.fullmatch(r"\d+(?:\.\d+)?", text):
+        return max(0, int(round(float(text))))
+    if re.fullmatch(r"\d+(?::\d{1,2}){1,2}", text):
+        parts = [int(item) for item in text.split(":")]
+        while len(parts) < 3:
+            parts.insert(0, 0)
+        return parts[0] * 3600 + parts[1] * 60 + parts[2]
+    total = 0.0
+    matched = False
+    for number, unit in re.findall(r"(\d+(?:\.\d+)?|半)\s*(小时|分钟|分|秒钟|秒)", text):
+        amount = 0.5 if number == "半" else float(number)
+        total += amount * _TIME_UNITS[unit]
+        matched = True
+    if matched:
+        return max(0, int(round(total)))
+    raise ActionError(
+        f"看不懂时间 “{value}”：可以试 “3:20”“3分20秒”“一分半”“200”（秒）"
+    )
+
+
+def format_seconds(seconds: Any) -> str:
+    """秒数 -> ``3:20`` / ``1:02:03``（日志显示用）。"""
+    total = max(0, int(seconds))
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+def with_time_param(url: str, seconds: Any) -> str:
+    """把网址的 ``t=`` 参数设成指定秒数，其余参数保留。
+
+    bilibili 与 YouTube 都支持用 ``t=``（秒）从指定时间开始播放。
+    """
+    parts = urlsplit(str(url or "").strip())
+    if not parts.scheme or not parts.netloc:
+        raise ActionError(f"地址栏里的内容不像网址：{url!r}")
+    query = [
+        (key, item)
+        for key, item in parse_qsl(parts.query, keep_blank_values=True)
+        if key.lower() != "t"
+    ]
+    query.append(("t", str(max(0, int(seconds)))))
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
+CF_UNICODETEXT = 13
+GMEM_MOVEABLE = 0x0002
+_clipboard_ready = False
+
+
+def _clipboard_api() -> tuple[Any, Any]:
+    """取 user32 / kernel32 并设好剪贴板函数的参数类型（只需一次）。
+
+    64 位下句柄是指针，不设 ``restype`` 会被 ctypes 截断成 32 位 int。
+    """
+    global _clipboard_ready
+    user32 = _user32()
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    if not _clipboard_ready:
+        kernel32.GlobalAlloc.restype = ctypes.c_void_p
+        kernel32.GlobalAlloc.argtypes = (ctypes.c_uint, ctypes.c_size_t)
+        kernel32.GlobalLock.restype = ctypes.c_void_p
+        kernel32.GlobalLock.argtypes = (ctypes.c_void_p,)
+        kernel32.GlobalUnlock.argtypes = (ctypes.c_void_p,)
+        kernel32.GlobalUnlock.restype = ctypes.c_int
+        kernel32.GlobalFree.argtypes = (ctypes.c_void_p,)
+        kernel32.GlobalFree.restype = ctypes.c_void_p
+        user32.OpenClipboard.argtypes = (ctypes.c_void_p,)
+        user32.OpenClipboard.restype = ctypes.c_int
+        user32.CloseClipboard.restype = ctypes.c_int
+        user32.EmptyClipboard.restype = ctypes.c_int
+        user32.GetClipboardData.restype = ctypes.c_void_p
+        user32.GetClipboardData.argtypes = (ctypes.c_uint,)
+        user32.SetClipboardData.restype = ctypes.c_void_p
+        user32.SetClipboardData.argtypes = (ctypes.c_uint, ctypes.c_void_p)
+        _clipboard_ready = True
+    return user32, kernel32
+
+
+def read_clipboard_text() -> str:
+    """读剪贴板里的文本；没有文本时返回空串。"""
+    if os.name != "nt":  # pragma: no cover - 非 Windows 不做剪贴板
+        raise ActionError("读取剪贴板目前只支持 Windows")
+    user32, kernel32 = _clipboard_api()
+    if not user32.OpenClipboard(None):
+        raise ActionError("打不开剪贴板（可能被其它程序占用），稍后再试")
+    try:
+        handle = user32.GetClipboardData(CF_UNICODETEXT)
+        if not handle:
+            return ""
+        pointer = kernel32.GlobalLock(handle)
+        if not pointer:
+            return ""
+        try:
+            return str(ctypes.wstring_at(pointer))
+        finally:
+            kernel32.GlobalUnlock(handle)
+    finally:
+        user32.CloseClipboard()
+
+
+def write_clipboard_text(text: str) -> bool:
+    """把文本写回剪贴板（失败返回 False，不抛异常）。"""
+    if os.name != "nt":  # pragma: no cover
+        return False
+    user32, kernel32 = _clipboard_api()
+    buffer = ctypes.create_unicode_buffer(str(text))
+    size = ctypes.sizeof(buffer)
+    if not user32.OpenClipboard(None):
+        return False
+    try:
+        if not user32.EmptyClipboard():
+            return False
+        handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, size)
+        if not handle:
+            return False
+        pointer = kernel32.GlobalLock(handle)
+        if not pointer:
+            kernel32.GlobalFree(handle)
+            return False
+        try:
+            ctypes.memmove(pointer, buffer, size)
+        finally:
+            kernel32.GlobalUnlock(handle)
+        if not user32.SetClipboardData(CF_UNICODETEXT, handle):
+            kernel32.GlobalFree(handle)
+            return False
+        return True
+    finally:
+        user32.CloseClipboard()
 
 
 # --------------------------------------------------------------------------- #
@@ -396,6 +699,91 @@ class ActionExecutor:
             return ActionResult(True, "app", f"打开 {target}（演练，未真正打开）")
         self._open_target(target, shell=bool(action.get("shell", False)), cwd=action.get("cwd"))
         return ActionResult(True, "app", f"打开 {target}")
+
+    def _do_url(self, action: dict, ctx: ActionContext) -> ActionResult:
+        raw = self._render(str(action.get("target", "")), ctx).strip()
+        target = normalize_url(raw)
+        if ctx.dry_run:
+            return ActionResult(True, "url", f"打开 {target}（演练，未真正打开）")
+        webbrowser.open(target)
+        return ActionResult(True, "url", f"打开 {target}")
+
+    def _do_click(self, action: dict, ctx: ActionContext) -> ActionResult:
+        try:
+            x = float(action.get("x"))
+            y = float(action.get("y"))
+        except (TypeError, ValueError) as exc:
+            raise ActionError("click 需要 x 和 y（屏幕坐标，先用 `vc pos` 量一下）") from exc
+        button = str(action.get("button", "left") or "left").strip().lower()
+        if button not in MOUSE_BUTTONS:
+            raise ActionError(f"不认识的鼠标键 “{button}”。可用：{'/'.join(MOUSE_BUTTONS)}")
+        try:
+            count = max(1, int(action.get("count", 1) or 1))
+        except (TypeError, ValueError):
+            count = 1
+        try:
+            interval_ms = max(0, int(action.get("interval_ms", 60) or 0))
+        except (TypeError, ValueError):
+            interval_ms = 60
+        detail = f"({x:.0f}, {y:.0f}) {button} x{count}"
+        if ctx.dry_run:
+            return ActionResult(True, "click", f"点击 {detail}（演练，未真正点击）")
+        click_at(x, y, button, count, interval_ms)
+        return ActionResult(True, "click", f"点击 {detail}")
+
+    def _do_seek(self, action: dict, ctx: ActionContext) -> ActionResult:
+        seconds = self._seek_seconds(action, ctx)
+        stamp = format_seconds(seconds)
+        if ctx.dry_run:
+            return ActionResult(True, "seek", f"跳到 {stamp}（演练，未跳转）")
+        if os.name != "nt":  # pragma: no cover - 非 Windows 不操作地址栏
+            raise ActionError("seek 动作目前只支持 Windows（需要操作浏览器地址栏）")
+        original = ""
+        try:
+            original = read_clipboard_text()
+        except ActionError:
+            original = ""
+        # 1) 选中地址栏并复制，拿到当前网址
+        self._send_hotkey(["ctrl", "l"])
+        time.sleep(0.25)
+        self._send_hotkey(["ctrl", "c"])
+        time.sleep(0.25)
+        current = read_clipboard_text().strip()
+        if not _SCHEME.match(current):
+            if original:
+                write_clipboard_text(original)
+            raise ActionError(
+                "没能从地址栏读到当前网址（先点一下浏览器窗口，让焦点在浏览器上再试）。"
+                f"读到的内容是：{current[:80]!r}"
+            )
+        # 2) 改写 t= 参数后回到地址栏回车
+        target = with_time_param(current, seconds)
+        self._send_hotkey(["ctrl", "l"])
+        time.sleep(0.15)
+        self._type_text(target)
+        time.sleep(0.1)
+        self._tap("enter")
+        if original and original != current:
+            write_clipboard_text(original)
+        return ActionResult(True, "seek", f"跳到 {stamp}：{target}")
+
+    def _slot_value(self, ctx: ActionContext, name: str) -> str | None:
+        wanted = str(name).strip().lower()
+        for key, value in ctx.slots.items():
+            if str(key).strip().lower() == wanted:
+                return str(value)
+        return None
+
+    def _seek_seconds(self, action: dict, ctx: ActionContext) -> int:
+        slot = str(action.get("slot", "") or "").strip()
+        if slot:
+            value = self._slot_value(ctx, slot)
+            if value is None or not value.strip():
+                raise ActionError(f"模型没有给出时间（槽位 “{slot}” 是空的）")
+            return parse_seconds(value)
+        if "seconds" in action:
+            return parse_seconds(action.get("seconds"))
+        raise ActionError("seek 需要 slot（槽位名）或 seconds（秒数）")
 
     def _do_focus(self, action: dict, ctx: ActionContext) -> ActionResult:
         title = self._render(str(action.get("title", "")), ctx).strip()

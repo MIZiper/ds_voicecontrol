@@ -14,10 +14,15 @@ from voice_control.actions import (
     ActionExecutor,
     _integrity_name,
     foreground_window,
+    format_seconds,
     known_key_names,
+    normalize_url,
+    normalized_point,
+    parse_seconds,
     process_integrity_level,
     resolve_key,
     window_process_id,
+    with_time_param,
 )
 from voice_control.config import ACTION_TYPES
 
@@ -239,3 +244,136 @@ def test_window_probe_helpers_do_not_crash() -> None:
     hwnd, title = foreground_window()
     assert isinstance(title, str)
     assert isinstance(window_process_id(hwnd), int)
+
+
+# --------------------------------------------------------------------------- #
+# 打开网址（url 动作）
+# --------------------------------------------------------------------------- #
+def test_normalize_url_adds_https() -> None:
+    assert normalize_url("bilibili.com") == "https://bilibili.com"
+    assert normalize_url("www.baidu.com/s?wd=x") == "https://www.baidu.com/s?wd=x"
+    assert normalize_url("  github.com/x/y  ") == "https://github.com/x/y"
+
+
+def test_normalize_url_keeps_existing_scheme() -> None:
+    assert normalize_url("https://www.zhihu.com/question/1") == "https://www.zhihu.com/question/1"
+    assert normalize_url("http://example.com") == "http://example.com"
+
+
+@pytest.mark.parametrize("bad", ["百度", "notepad", "file:///c:/x", "百度的.com", "。。"])
+def test_normalize_url_rejects_non_url(bad: str) -> None:
+    with pytest.raises(ActionError):
+        normalize_url(bad)
+
+
+def test_url_action_dry_run() -> None:
+    context = ActionContext(dry_run=True, slots={"url": "bilibili.com"})
+    results = _executor().execute({"type": "url", "target": "{url}"}, context)
+    assert results[0].ok
+    assert "https://bilibili.com" in results[0].detail
+
+
+def test_url_action_reports_bad_slot() -> None:
+    context = ActionContext(dry_run=True, slots={"url": "百度"})
+    results = _executor().execute({"type": "url", "target": "{url}"}, context)
+    assert not results[0].ok
+    assert "网址" in results[0].detail
+
+
+# --------------------------------------------------------------------------- #
+# 跳到指定时间（seek 动作）
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("200", 200),
+        (200, 200),
+        ("3:20", 200),
+        ("1:02:03", 3723),
+        ("3分20秒", 200),
+        ("三分二十秒", 200),
+        ("一分半", 90),
+        ("半小时", 1800),
+        ("1小时2分", 3720),
+    ],
+)
+def test_parse_seconds(value: object, expected: int) -> None:
+    assert parse_seconds(value) == expected
+
+
+def test_parse_seconds_rejects_garbage() -> None:
+    with pytest.raises(ActionError):
+        parse_seconds("随便说点什么")
+
+
+def test_format_seconds() -> None:
+    assert format_seconds(200) == "3:20"
+    assert format_seconds(59) == "0:59"
+    assert format_seconds(3723) == "1:02:03"
+
+
+def test_with_time_param_replaces_and_keeps_others() -> None:
+    url = with_time_param("https://www.bilibili.com/video/BV1x?p=2&t=30&spm=a.b", 200)
+    assert url == "https://www.bilibili.com/video/BV1x?p=2&spm=a.b&t=200"
+
+
+def test_with_time_param_appends_when_missing() -> None:
+    assert with_time_param("https://www.bilibili.com/video/BV1x", 90).endswith("?t=90")
+
+
+def test_seek_dry_run_uses_slot() -> None:
+    context = ActionContext(dry_run=True, slots={"sec": "3分20秒"})
+    results = _executor().execute({"type": "seek", "slot": "sec"}, context)
+    assert results[0].ok
+    assert "3:20" in results[0].detail
+
+
+def test_seek_without_time_fails() -> None:
+    context = ActionContext(dry_run=True, declared_slots=("sec",))
+    results = _executor().execute({"type": "seek", "slot": "sec"}, context)
+    assert not results[0].ok
+    assert "sec" in results[0].detail
+
+
+def test_seek_literal_seconds() -> None:
+    results = _executor().execute({"type": "seek", "seconds": 125})
+    assert results[0].ok
+    assert "2:05" in results[0].detail
+
+
+# --------------------------------------------------------------------------- #
+# 模拟点击（click 动作）
+# --------------------------------------------------------------------------- #
+def test_normalized_point_maps_corners() -> None:
+    assert normalized_point(0, 0, 0, 0, 1920, 1080) == (0, 0)
+    assert normalized_point(1919, 1079, 0, 0, 1920, 1080) == (65535, 65535)
+
+
+def test_normalized_point_handles_negative_origin() -> None:
+    """多显示器时虚拟屏幕原点可能是负数。"""
+    assert normalized_point(-1920, 0, -1920, 0, 3840, 1080) == (0, 0)
+    assert normalized_point(0, 0, -1920, 0, 3840, 1080)[0] > 32000
+
+
+def test_click_dry_run() -> None:
+    results = _executor().execute({"type": "click", "x": 1850, "y": 60})
+    assert results[0].ok
+    assert "(1850, 60)" in results[0].detail
+
+
+def test_click_double_dry_run() -> None:
+    results = _executor().execute({"type": "click", "x": 960, "y": 540, "count": 2})
+    assert results[0].ok
+    assert "x2" in results[0].detail
+
+
+def test_click_missing_coordinates_fails() -> None:
+    results = _executor().execute({"type": "click", "x": 10})
+    assert not results[0].ok
+    assert "x 和 y" in results[0].detail
+
+
+def test_click_bad_button_fails() -> None:
+    results = _executor().execute({"type": "click", "x": 10, "y": 10, "button": "脚"})
+    assert not results[0].ok
+    assert "鼠标键" in results[0].detail

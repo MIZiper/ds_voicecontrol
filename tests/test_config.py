@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from voice_control.config import (
+    ACTION_TYPES,
     ConfigError,
     load_config,
     load_config_or_defaults,
@@ -24,6 +25,65 @@ def test_default_config_has_wake_llm_and_rules(tmp_path: Path) -> None:
     assert config.llm.api_key_env == "DASHSCOPE_API_KEY"
     assert config.audio.sample_rate == 16000
     assert len(config.rules) >= 20
+
+
+def test_default_config_has_new_action_types(tmp_path: Path) -> None:
+    config = load_config(write_default_config(tmp_path / "config.toml"))
+    for kind in ("url", "click", "seek"):
+        assert kind in ACTION_TYPES
+        assert kind in config.commands.allow
+
+
+def test_default_config_has_web_and_site_rules(tmp_path: Path) -> None:
+    config = load_config(write_default_config(tmp_path / "config.toml"))
+    for rule_id in (
+        "open_site",
+        "page_back",
+        "page_forward",
+        "tab_next",
+        "tab_prev",
+        "web_play_pause",
+        "bili_seek",
+        "bili_speed_1x",
+        "bili_speed_2x",
+        "fullscreen_toggle",
+        "fullscreen_browser",
+        "exit_fullscreen",
+    ):
+        assert config.rule_by_id(rule_id) is not None, rule_id
+    assert config.rule_by_id("open_site").slots == ["url"]
+    assert config.rule_by_id("open_site").action == {"type": "url", "target": "{url}"}
+    assert config.rule_by_id("page_back").action["keys"] == ["alt", "left"]
+    assert config.rule_by_id("page_forward").action["keys"] == ["alt", "right"]
+    assert config.rule_by_id("tab_next").action["keys"] == ["ctrl", "tab"]
+    assert config.rule_by_id("tab_prev").action["keys"] == ["ctrl", "shift", "tab"]
+    assert config.rule_by_id("web_play_pause").action["keys"] == ["space"]
+    assert config.rule_by_id("bili_seek").action["slot"] == "sec"
+    assert config.rule_by_id("bili_speed_2x").action["keys"] == ["shift", "2"]
+    assert config.rule_by_id("fullscreen_toggle").action["keys"] == ["f"]
+    assert config.rule_by_id("fullscreen_browser").action["keys"] == ["f11"]
+    assert config.rule_by_id("exit_fullscreen").action["keys"] == ["esc"]
+
+
+def test_bad_click_rule_is_skipped_with_warning(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        """
+[[rules]]
+id = "skip"
+name = "跳过"
+phrases = ["跳过"]
+type = "click"
+x = 100
+button = "脚"
+""",
+        encoding="utf-8",
+    )
+    config = load_config(path)
+    assert config.rule_by_id("skip") is None
+    warnings = "\n".join(config.warnings)
+    assert "y" in warnings
+    assert "button" in warnings
 
 
 def test_rules_have_id_description_and_slots(tmp_path: Path) -> None:

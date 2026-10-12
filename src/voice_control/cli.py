@@ -27,8 +27,10 @@ from pathlib import Path
 
 from . import __version__, ui
 from .actions import (
+    ActionError,
     ActionExecutor,
     chain_looks_like_interactive_shell,
+    cursor_position,
     foreground_window,
     integrity_via_whoami,
     known_key_names,
@@ -471,6 +473,73 @@ def cmd_keytest(args: argparse.Namespace) -> int:
     return EXIT_OK if status != "fail" else EXIT_ERROR
 
 
+def cmd_pos(args: argparse.Namespace) -> int:
+    """实时显示鼠标坐标，用来量 click 动作要填的 x / y。"""
+    ui.title("鼠标坐标（把鼠标移到目标按钮上，读最后一行）")
+    if process_integrity_level() == "Low":
+        ui.warn(
+            "当前进程完整性级别是 Low：模拟点击和按键都会被系统丢掉。"
+            "真要用点击功能，请换成不受限的解释器/终端。"
+        )
+    seconds = float(getattr(args, "seconds", 0) or 0)
+    deadline = time.monotonic() + seconds if seconds > 0 else None
+    last: tuple[int, int] | None = None
+    ui.plain("")
+    try:
+        while True:
+            last = cursor_position()
+            print(f"\r  x = {last[0]:<6d} y = {last[1]:<6d}", end="", flush=True)
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+    except ActionError as exc:
+        print()
+        ui.error(str(exc))
+        return EXIT_ERROR
+    except KeyboardInterrupt:
+        pass
+    print()
+    if last is None:
+        return EXIT_OK
+    x, y = last
+    ui.ok(f"最后位置：x = {x}, y = {y}")
+    ui.plain("  填进 config.toml 的 [[rules]]，例如：")
+    ui.plain("    type = \"click\"")
+    ui.plain(f"    x = {x}")
+    ui.plain(f"    y = {y}")
+    return EXIT_OK
+
+
+def cmd_click(args: argparse.Namespace) -> int:
+    """在指定坐标点一下，验证点击能不能生效。"""
+    executor = ActionExecutor(allow=("click",), dry_run=args.dry_run)
+    try:
+        before = cursor_position()
+    except ActionError:
+        before = None
+    if before is not None:
+        ui.plain(f"  点击前鼠标位置：x = {before[0]}, y = {before[1]}")
+    if process_integrity_level() == "Low":
+        ui.warn("当前进程完整性级别是 Low：点击会被系统丢掉（和按键是同一个限制）。")
+    results = executor.execute(
+        {
+            "type": "click",
+            "x": args.x,
+            "y": args.y,
+            "button": args.button,
+            "count": args.count,
+        }
+    )
+    for item in results:
+        (ui.ok if item.ok else ui.error)(f"  {item}")
+    if not all(item.ok for item in results):
+        return EXIT_ERROR
+    ui.plain("  点击已发出。如果屏幕上什么都没发生：")
+    ui.plain("    · 目标窗口以管理员身份运行 → 让 vc 也以管理员运行")
+    ui.plain("    · 坐标不对 → 用 `vc pos` 重新量（窗口/全屏两种状态位置可能不同）")
+    return EXIT_OK
+
+
 def cmd_rules(args: argparse.Namespace) -> int:
     try:
         config = load_config(args.config)
@@ -703,6 +772,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="额外做一次跨程序测试：倒计时后向当前前台窗口输入一段文字（需你手动聚焦目标窗口）",
     )
     sub.set_defaults(func=cmd_keytest)
+
+    sub = add_common(subparsers.add_parser("pos", help="实时显示鼠标坐标（给 click 动作量位置）"))
+    sub.add_argument("--seconds", type=float, default=0, help="显示多少秒后自动结束（默认一直显示到 Ctrl+C）")
+    sub.set_defaults(func=cmd_pos)
+
+    sub = add_common(subparsers.add_parser("click", help="在指定屏幕坐标测试点击"))
+    sub.add_argument("x", type=float, help="屏幕 X 坐标（用 vc pos 量）")
+    sub.add_argument("y", type=float, help="屏幕 Y 坐标")
+    sub.add_argument("--button", default="left", choices=["left", "right", "middle"], help="鼠标键（默认 left）")
+    sub.add_argument("--count", type=int, default=1, help="连点次数（2 = 双击）")
+    sub.add_argument("--dry-run", action="store_true", help="只显示，不真的点击")
+    sub.set_defaults(func=cmd_click)
 
     sub = add_common(subparsers.add_parser("doctor", help="自检 + 真实调用一次大模型"))
     sub.add_argument("--text", default="复制一下", help="用这句话测试大模型，默认“复制一下”")
