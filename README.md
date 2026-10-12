@@ -1,290 +1,190 @@
 # ds_voicecontrol
 
-本地跑的中文语音控制小工具：说一句 **“小助手，复制”**，它就替你按 `Ctrl+C`；
-说 **“小助手，搜索今天天气”**，它打开新标签页、输入“今天天气”并回车。
+**本地只做两件事**：判断有没有人在说话、听有没有人喊唤醒词。
+**命令理解交给大模型**：唤醒后的那一段语音直接（音频）发给多模态模型，由它从你配置的**命令表**里挑一条。
+**动作在本地执行**：按键、输入中文、打开程序、激活窗口、组合动作。
 
-全程离线（默认用 Vosk 中文小模型，42MB），音频不上传，规则、唤醒词、门限全部写在
-一个 `config.toml` 里。
+```
+说：小助手 ……（蜂鸣）…… 打开记事本
+    │                     │
+    │ 本地 KWS 唤醒        │ 本地 VAD 判断说话起止，录下这一句
+    ▼                     ▼
+ sherpa-onnx 关键词检测 ──> 音频(16k wav) ──> 大模型(OpenAI 兼容 / qwen-audio)
+                                                    │
+                                    {"command":"open_notepad","transcript":"打开记事本"}
+                                                    │
+                                     命令表校验 id ──> 本地执行动作
+```
+
+这样设计的三个理由：
+
+1. **准确率**：中文口语 + 远场，靠本地小模型识别整句本来就不靠谱；多模态大模型直接听音频，同义说法（“搞一下”“帮我拷一份”）也能对上。
+2. **隐私与成本**：唤醒词之前的音频**完全不出本地**；只说了唤醒词的那次**不会联网**（只开一个等待窗口）；每次命令只上传 1~2 秒语音。
+3. **安全**：模型只能返回你命令表里存在的 `id`，返回别的（比如 `rm_rf`）会被拒绝执行，什么都不会发生。
 
 ---
 
 ## 目录
 
-- [特性](#特性)
-- [工作原理](#工作原理)
 - [快速开始](#快速开始)
-- [命令行子命令](#命令行子命令)
-- [配置文件详解](#配置文件详解)
-- [口令规则怎么写](#口令规则怎么写)
-- [唤醒词与门限调优](#唤醒词与门限调优)
-- [换识别引擎（更准的模型）](#换识别引擎更准的模型)
+- [命令行](#命令行)
+- [配置文件](#配置文件)
+- [命令表（安全边界）](#命令表安全边界)
+- [唤醒词](#唤醒词)
+- [大模型配置](#大模型配置)
+- [麦克风与门限](#麦克风与门限)
 - [常见问题](#常见问题)
 - [安全说明](#安全说明)
 - [项目结构与开发](#项目结构与开发)
 - [已知限制与后续方向](#已知限制与后续方向)
 
----
-
-## 特性
-
-- **离线**：默认 Vosk 中文小模型（约 42MB），不需要联网、不上传音频。
-- **自动测底噪**：`vc calibrate` 监听几秒环境噪音，自动算出一个静音门限写回配置；
-  运行时还会跟随底噪自动抬高门限（空调、风扇变化也能适应）。
-- **唤醒词可配**：`小助手` / `你好小助手` … 支持模糊匹配，识别听错一两个字也能唤醒；
-  也可以关掉唤醒词，听到口令直接执行。
-- **口令可配**：触发词 + 动作，全部写在 TOML 里，支持“槽位”：
-  `搜索 今天天气` 会把“今天天气”填进动作模板。
-- **动作够用**：组合键（`ctrl+c`）、按键（`enter`、`volumeup`…）、中文文字输入、
-  打开程序/文件/网址、等待、动作组合序列、执行命令（默认禁用）。
-- **安全的调试手段**：`--dry-run` 演练模式、`vc say` 直接测一句话、`vc run --wav` 用音频文件测，
-  都不需要对着麦克风反复喊。
-- **开箱 22 条规则**：复制、粘贴、剪切、撤销、保存、全选、输入、确认、关闭窗口、切换窗口、
-  显示桌面、打开浏览器/记事本、搜索、新标签页、关闭标签页、翻页、音量加减、静音、播放暂停。
-
-## 工作原理
-
-```
-麦克风 ──30ms 一帧──▶ 音量门限分段（VAD-lite）──▶ 语音识别（Vosk / faster-whisper）
-                                                        │
-                                   唤醒词匹配 ◀─────────┤
-                                                        ▼
-                                     口令匹配（归一化 + 模糊 + 槽位）
-                                                        │
-                                                        ▼
-                                     动作执行（pynput 按键 / SendInput 中文输入）
-```
-
-几个设计取舍：
-
-- **不用专用唤醒引擎**（如 Porcupine / openWakeWord），而是“识别文本里找唤醒词”。
-  好处是零额外依赖、唤醒词随便改、中文友好；代价是比专用引擎费一点 CPU，
-  嘈杂环境里可能误唤醒（后文有调优办法）。
-- **分段只用音量**，不引入 Vosk 的流式部分结果，逻辑简单、可单元测试，也方便换引擎。
-- **中文文字输入用 `SendInput` 的 Unicode 模式**，不走输入法、不受键盘布局影响。
-
 ## 快速开始
 
-前置：Windows 10/11、[uv](https://docs.astral.sh/uv/)（Python 由 uv 自己管理）。
+前置：Windows 10/11、[uv](https://docs.astral.sh/uv/)（Python 由 uv 管理）、一个阿里云百炼（DashScope）API Key。
 
 ```powershell
-uv sync                   # 1. 安装依赖（会自动准备好 Python 3.12）
-uv run vc init            # 2. 生成带中文注释的 config.toml
-uv run vc devices         # 3. （可选）看看麦克风编号和名称
-uv run vc calibrate       # 4. 安静 5 秒，测环境底噪并写入静音门限
-uv run vc setup           # 5. 下载中文识别模型（约 42MB，首次需要联网）
-uv run vc run             # 6. 开始监听，Ctrl+C 退出
+uv sync                                          # 1. 安装依赖（含 sherpa-onnx 唤醒词引擎）
+$env:DASHSCOPE_API_KEY = "sk-你的key"              # 2. 设置大模型 Key（也可以写进配置）
+uv run vc init                                   # 3. 生成 config.toml
+uv run vc calibrate                              # 4. 安静 5 秒，测环境底噪
+uv run vc setup                                  # 5. 下载中文唤醒词模型（约 31MB）
+uv run vc wake                                   # 6. 只测唤醒词：喊“小助手”看有没有反应
+uv run vc doctor                                 # 7. 自检 + 真实调用一次大模型
+uv run vc run                                    # 8. 开始监听，Ctrl+C 退出
 ```
 
-然后对着麦克风说：**“小助手，复制”** —— 当前窗口的选中内容会被复制。
+然后说：**“小助手”**（听到蜂鸣）**“打开记事本”** —— 记事本会被打开。
 
-建议第一次先演练，确认规则符合预期再真跑：
+调试期建议加 `--dry-run`：识别和决策照常，只是不真的按键。
 
 ```powershell
-uv run vc run --dry-run    # 识别、匹配照常，但不真的按键 / 不打开程序
-uv run vc say "小助手 复制" --dry-run   # 直接测一句话，连麦克风都不用
+uv run vc run --dry-run                # 演练模式
+uv run vc say "把声音调小一点"          # 不碰麦克风，直接把一句话交给大模型（--dry-run 可演练）
+uv run vc run --wav 录音.wav --dry-run  # 用音频文件跑完整链路
+uv run vc run --no-wake                # 本次不需要唤醒词
 ```
 
-不想每次都说唤醒词（比如戴着耳机一个人用）时可以：
-
-```powershell
-uv run vc run --no-wake               # 本次运行不需要唤醒词
-# 或者改配置： [wake] require_wake = false
-```
-
-## 命令行子命令
+## 命令行
 
 | 命令 | 作用 |
 | --- | --- |
-| `vc init [--force]` | 生成默认配置（`--force` 覆盖已有文件） |
-| `vc devices` | 列出可用的输入设备（编号 / 名称 / 默认设备） |
-| `vc meter [--seconds 10]` | 实时电平表：看麦克风有没有声音、门限合不合适 |
-| `vc calibrate [--seconds 5] [--no-write]` | 测环境底噪，给出并写入静音门限 |
-| `vc setup [--model 名称] [--engine vosk\|whisper]` | 下载 / 检查识别模型 |
-| `vc rules [--all]` | 打印当前所有口令规则 |
-| `vc say "文本" [--dry-run] [--no-wake]` | 不走麦克风，直接把文本喂给口令匹配（调规则神器） |
-| `vc run [选项]` | **开始监听（主功能）** |
-| `vc version` | 版本号 |
+| `vc init [--force]` | 生成带中文注释的默认配置 |
+| `vc devices` | 列出可用麦克风 |
+| `vc meter [--seconds 10]` | 实时电平表：麦克风有没有声音、门限合不合适 |
+| `vc calibrate [--seconds 5] [--no-write]` | 测环境底噪并写入 `audio.noise_threshold` |
+| `vc setup [--model 名称]` | 下载本地唤醒词模型 |
+| `vc wake [--seconds 20] [--threshold 0.15] [--wav 文件]` | **只测唤醒词**，不联网 |
+| `vc rules [--all]` | 查看允许执行的命令表 |
+| `vc keytest [--cross-app]` | **按键自测**：判断“日志显示成功但程序没反应”到底是哪种原因 |
+| `vc doctor [--text "复制一下"]` | 自检（配置 / Key / 模型 / 完整性级别）+ 真实调用一次大模型 |
+| `vc say "文本" [--dry-run]` | 不走麦克风，直接把一句话交给大模型并执行 |
+| `vc run [--dry-run] [--no-wake] [--once] [--duration 秒] [--wav 文件] [--device 设备]` | **开始监听（主功能）** |
 
-`vc run` 的选项：
+通用：`--config/-c 路径`（也可用环境变量 `VC_CONFIG`）、`--no-color`。
 
-| 选项 | 说明 |
-| --- | --- |
-| `--dry-run` | 演练：不真正执行动作 |
-| `--no-wake` | 本次运行不需要唤醒词 |
-| `--once` | 只处理一段语音就退出 |
-| `--duration 秒` | 监听指定秒数后自动退出（方便脚本化验证） |
-| `--wav 文件.wav` | 不接麦克风，直接处理一个 wav 文件 |
-| `--device 名称或编号` | 临时指定输入设备 |
-| `--engine vosk\|whisper` | 临时切换识别引擎 |
+## 配置文件
 
-通用选项：`--config/-c 路径` 指定配置文件（也可以用环境变量 `VC_CONFIG`），`--no-color` 关掉彩色输出。
+`vc init` 生成的 `config.toml` 每一项都有中文注释，关键项如下。
 
-实测例子（用合成的中文语音走完整链路）：
-
-```text
-> uv run vc run --wav .tmp-test\wake_search.wav --dry-run
-处理音频文件：wake_search.wav（3.0 秒）
-听到: 小助手搜索今天天气
-已唤醒（唤醒词：小助手）
-命中「搜索」得分=0.98 槽位='今天天气'
-    [OK] hotkey: ctrl+t（演练，未真正按下）
-    [OK] text: 输入 '今天天气'（演练，未真正输入）
-    [OK] press: enter x1（演练，未真正按下）
-    [OK] sequence: 共 3 步
-```
-
-## 配置文件详解
-
-`vc init` 生成的 `config.toml` 里每一项都有中文注释，这里再解释几个关键点。
-
-### `[general]`
-
-| 项 | 说明 |
-| --- | --- |
-| `language` | `zh` / `en`，传给识别引擎 |
-| `log_level` | `debug` 时会打印每段音频的时长、峰值电平等信息 |
-
-### `[audio]`
+### `[audio]` 麦克风与“有没有说话”
 
 | 项 | 默认 | 说明 |
 | --- | --- | --- |
-| `device` | `""` | 留空=系统默认麦克风；也可填编号或名称片段（如 `"Headset"`） |
-| `sample_rate` | `16000` | 识别模型要求的采样率，一般不要改 |
-| `frame_ms` | `30` | 每帧时长，越小越灵敏、CPU 略高 |
-| `pre_roll_ms` | `300` | 说话前多留一点音频，避免第一个字被切掉 |
-| `min_speech_ms` | `250` | 短于这个时长的不算说话（过滤咳嗽、敲键盘） |
-| `max_utterance_ms` | `8000` | 单句最长录音时长，超长强制截断 |
-| `silence_ms` | `700` | 停顿超过这个时长认为一句话说完 |
-| `noise_threshold` | `0.010` | **静音门限**，`vc calibrate` 自动写入（RMS，0~1） |
-| `threshold_factor` | `2.5` | 动态倍数：实际门限 = `max(noise_threshold, 实时底噪 × 倍数)` |
-| `adaptive_noise` | `true` | 是否跟随环境底噪自动调整门限 |
+| `device` | `""` | 留空=系统默认麦克风；可填编号或名称片段（`vc devices` 查看） |
+| `sample_rate` / `frame_ms` | 16000 / 30 | 音频参数，一般不用改 |
+| `pre_roll_ms` | 300 | 说话前多留一点，避免第一个字被切掉 |
+| `min_speech_ms` | 250 | 短于这个时长不算说话（过滤咳嗽、敲键盘） |
+| `silence_ms` | 700 | 停顿超过这个时长认为这句话说完 → 送去大模型 |
+| `noise_threshold` | 0.010 | 静音门限，`vc calibrate` 自动写入 |
+| `threshold_factor` | 2.5 | 实际门限 = `max(noise_threshold, 实时底噪 × 倍数)` |
+| `adaptive_noise` | `true` | 是否跟随底噪自动调整（空调/风扇变化时有用） |
 
-门限怎么理解：
-
-- `noise_threshold` 是“底线”，低于它一律当静音；
-- 运行时每秒都会估计一次环境底噪（只在判定为静音时更新），把它乘以 `threshold_factor`
-  得到动态门限，取两者较大值。
-- 所以：安静房间里门限≈`noise_threshold`；开着空调变吵了，门限会自己抬高，不会一直误触发。
-
-### `[asr]`
+### `[wake]` 本地唤醒词
 
 | 项 | 默认 | 说明 |
 | --- | --- | --- |
-| `engine` | `vosk` | `vosk`（离线轻量）或 `whisper`（faster-whisper，更准更慢） |
+| `enabled` | `true` | `false` = 不需要唤醒词，检测到说话就直接发给大模型 |
+| `words` | `["小助手","你好小助手"]` | 中文唤醒词，程序自动转成拼音 token 生成关键词文件 |
+| `model` | `sherpa-onnx-kws-...-wenetspeech-3.3M-2024-01-01` | 中文唤醒词模型 |
 | `models_dir` | `models` | 模型目录（相对配置文件所在目录） |
-| `vosk_model` | `vosk-model-small-cn-0.22` | 中文小模型；想更准可换 `vosk-model-cn-0.22` |
-| `whisper_model` | `small` | `tiny`/`base`/`small`/`medium`/`large-v3` |
-| `whisper_device` | `cpu` | 有 NVIDIA 显卡且装了 CUDA 可设 `cuda` |
-| `whisper_compute_type` | `int8` | CPU 推荐 `int8`，显卡可 `float16` |
-| `hf_endpoint` | `""` | 国内下载慢时可填 `https://hf-mirror.com` |
-| `auto_download` | `true` | 模型缺失时是否自动下载 |
+| `keywords_file` | `""` | 留空 = 自动生成 `models/wake-keywords.txt` |
+| `threshold` | `0.25` | 命中阈值：调大更严格（不易误唤醒），调小更容易唤醒 |
+| `wait_ms` | `5000` | 唤醒后等你开口的最长时间（毫秒） |
+| `command_max_ms` | `8000` | 唤醒后单条口令最长录制时长 |
+| `auto_download` | `true` | 模型缺失时自动下载 |
+| `num_threads` | `2` | 关键词检测线程数 |
 
-### `[wake]`
-
-| 项 | 默认 | 说明 |
-| --- | --- | --- |
-| `enabled` | `true` | 是否启用唤醒词 |
-| `require_wake` | `true` | `false` = 不需要唤醒词，听到口令就执行 |
-| `words` | `["小助手", "你好小助手"]` | 唤醒词列表，识别文本里出现任意一个即唤醒 |
-| `fuzzy` | `0.82` | 整句模糊匹配阈值，越低越容易唤醒（也越容易误唤醒） |
-| `window_s` | `5.0` | 只说了唤醒词时，接下来多少秒内的下一句话按口令处理 |
-
-### `[commands]`
+### `[llm]` 大模型
 
 | 项 | 默认 | 说明 |
 | --- | --- | --- |
-| `allow` | `["hotkey","press","text","app","wait","sequence"]` | 动作类型白名单，不在里面的动作会被拒绝 |
-| `allow_shell` | `false` | 是否允许 `shell` 动作（跑命令行），默认关闭 |
-| `unknown` | `log` | 没匹配到口令时：`log` 打印 / `ignore` 静默 / `beep` 响一声 |
-| `match_threshold` | `0.75` | 口令模糊匹配阈值 |
-| `cooldown_ms` | `400` | 同一条规则的最小执行间隔，防止一句话重复触发 |
+| `base_url` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | OpenAI 兼容接口地址 |
+| `model` | `qwen-audio-turbo-latest` | 支持音频输入的模型 |
+| `api_key_env` | `DASHSCOPE_API_KEY` | **推荐**：Key 放环境变量，配置里只写变量名 |
+| `api_key` | `""` | 也可以直接写（优先级更高，但不建议提交到仓库） |
+| `timeout_s` | `30` | 单次请求超时 |
+| `response_format_json` | `true` | 要求返回 JSON；模型不支持时会自动去掉重试一次 |
+| `extra_prompt` | `""` | 补充提示词，可以写你自己的说法习惯 |
+| `save_audio_dir` | `""` | 调试用：把每次发给模型的音频存下来 |
 
-### `[feedback]`
+### `[commands]` 执行策略
 
 | 项 | 默认 | 说明 |
 | --- | --- | --- |
-| `beep` | `true` | 唤醒成功 / 命中口令时用系统提示音反馈 |
+| `allow` | `["hotkey","press","text","app","focus","wait","sequence"]` | 动作类型白名单，不在里面的动作会被拒绝 |
+| `allow_shell` | `false` | 是否允许 `shell` 动作（执行命令行），默认关闭 |
+| `unknown` | `log` | 没匹配到命令时：`log` / `ignore` / `beep` |
+| `cooldown_ms` | `400` | 同一条命令的最小间隔，防止一次说话重复触发 |
+| `fallback_local` | `true` | 模型没给命令但返回了原话时，用本地规则再匹配一次（兜底） |
 
-## 口令规则怎么写
+## 命令表（安全边界）
 
-一条规则 = **触发词** + **动作**：
+大模型**只能**从这里挑命令，挑不到就什么都不做。所以这张表就是你的安全边界：写进去什么，它才可能做什么。
 
 ```toml
 [[rules]]
-name = "复制"                    # 规则名，只用于显示
-phrases = ["复制", "拷贝"]        # 触发词：等于 / 以它开头 / 包含它 都算命中
-type = "hotkey"                  # 动作类型
-keys = ["ctrl", "c"]             # 动作参数
+id = "open_notepad"                    # 模型返回的就是这个 id；留空则用 name
+name = "打开记事本"                      # 只用于显示
+description = "打开 Windows 记事本"      # 给模型看的说明，写清楚“什么时候用它”
+phrases = ["打开记事本", "记事本"]         # 示例说法（也是本地兜底匹配的触发词）
+type = "app"
+target = "notepad"
 ```
 
-写动作有两种等价写法，随便挑：
+带槽位的例子（把说的话带进动作里）：
 
 ```toml
-# 扁平写法
 [[rules]]
-name = "保存"
-phrases = ["保存"]
-type = "hotkey"
-keys = ["ctrl", "s"]
-
-# 表写法
-[[rules]]
-name = "保存"
-phrases = ["保存"]
-action = { type = "hotkey", keys = ["ctrl", "s"] }
+id = "search"
+name = "搜索"
+description = "在浏览器里搜索用户说的内容，搜索词放进 query 槽位"
+phrases = ["搜索今天天气", "查一下", "百度一下"]
+slots = ["query"]
+type = "sequence"
+steps = [
+    { type = "hotkey", keys = ["ctrl", "t"] },
+    { type = "text", text = "{query}" },
+    { type = "press", keys = ["enter"] },
+]
 ```
+
+说“搜索今天天气”→ 模型返回 `{"command":"search","slots":{"query":"今天天气"}}` → 新标签页输入“今天天气”并回车。
 
 ### 动作类型
 
 | `type` | 参数 | 说明 |
 | --- | --- | --- |
 | `hotkey` | `keys` | 按下组合键，例如 `["ctrl", "shift", "t"]` |
-| `press` | `keys`、`repeat`、`interval_ms` | 依次点按键，可重复，例如音量加 `repeat = 3` |
-| `text` | `text` | 直接输入文字，支持 `{text}` `{date}` `{time}` `{datetime}` |
-| `app` | `target` | 打开程序 / 文件 / 网址，例如 `"notepad"`、`"https://…"` |
-| `wait` | `ms` | 等待若干毫秒 |
-| `sequence` | `steps = [ … ]` | 组合动作，按顺序执行，某一步失败会停止后续步骤 |
+| `press` | `keys`、`repeat`、`interval_ms` | 依次点按键，可重复（音量加 `repeat = 3`） |
+| `text` | `text` | 输入文字，支持 `{槽位}` `{text}` `{date}` `{time}` `{datetime}` |
+| `app` | `target` | 打开程序/文件/网址：`"notepad"`、`"https://…"` |
+| `focus` | `title` | 把标题包含该文字的窗口切到前台（按键总发错窗口时用） |
+| `wait` | `ms` | 等待 |
+| `sequence` | `steps = [ … ]` | 组合动作，某步失败会停止后续步骤 |
 | `shell` | `command`、`cwd` | 执行命令行（需要 `allow_shell = true`） |
 
-### 槽位（把说的话带进动作里）
-
-触发词后面的内容会作为 `{text}` 传下去：
-
-```toml
-[[rules]]
-name = "搜索"                       # 说“搜索 今天天气”
-phrases = ["搜索"]
-type = "sequence"
-steps = [
-    { type = "hotkey", keys = ["ctrl", "t"] },
-    { type = "text", text = "{text}" },      # → 输入“今天天气”
-    { type = "press", keys = ["enter"] },
-]
-```
-
-```toml
-[[rules]]
-name = "输入"
-phrases = ["输入", "打字"]           # 说“输入你好世界” → 键盘输入“你好世界”
-type = "text"
-text = "{text}"
-```
-
-### 匹配规则（为什么“帮我复制一下”也能命中“复制”）
-
-1. 归一化：全角转半角、去掉空格与中英文标点、转小写；
-2. 去掉口语填充词：句首的“嗯/那个/就是/麻烦/请/帮我/给我/把…”，句尾的“一下/吧/呀/吗/呢”；
-3. 依次比较每条规则的每个触发词：
-
-| 情况 | 得分 |
-| --- | --- |
-| 完全相同 | 1.00 |
-| 以触发词开头（后面还有内容 → 就是槽位） | 0.98 |
-| 触发词出现在句中 | 0.80~0.95（越靠前越高） |
-| 模糊相似（≥ `match_threshold`，触发词至少 3 个字） | 相似度 × 0.8 |
-
-取得分最高的一条执行；同一规则 400ms 内不会重复执行。
-匹配不上、且你没在唤醒窗口里说话时，就按 `commands.unknown` 处理。
+关于槽位：规则里声明了 `slots = ["query"]`，而模型这次没给出 `query` 时，`{query}` 会渲染成**空**，
+动作会明确报“渲染后的文本为空”，而不是把 `{query}` 这串字面量打出去。
 
 ### 可用的按键名
 
@@ -294,94 +194,188 @@ text = "{text}"
 | 常用 | `enter` `esc` `tab` `space` `backspace` `delete` `insert` `home` `end` |
 | 翻页/方向 | `pageup` `pagedown` `up` `down` `left` `right` |
 | 锁定/系统 | `capslock` `numlock` `printscreen` `scrolllock` `pause` `menu` |
-| 功能键 | `f1` ~ `f20` |
+| 功能键 | `f1` ~ `f24` |
 | 媒体 | `volumeup` `volumedown` `mute` `playpause` `nexttrack` `prevtrack` `stop` |
-| 字符 | 单个字母/数字/符号，例如 `["ctrl", "shift", "t"]`、`["/"]` |
+| 字符 | 单个字母/数字/符号，例如 `["ctrl", "shift", "t"]` |
 
-## 唤醒词与门限调优
+实现说明：Windows 下**按键和中文输入默认都走自带的 `SendInput` 封装**（组合键用虚拟键码 + 扩展键标志，
+文字用 `KEYEVENTF_UNICODE`），所以不依赖输入法、不受键盘布局影响，也不需要额外依赖。
+非 Windows 平台用 pynput 兜底：`uv sync --extra pynput`。
 
-**唤醒词**
+### 按键发错了窗口？
 
-- 想换唤醒词：直接改 `[wake] words`，例如 `["小助手", "电脑", "贾维斯"]`。
-  两三个字的常见词识别更稳；避免用“复制”“保存”这类会出现在口令里的词。
-- 经常喊了没反应：把 `fuzzy` 调到 `0.75`，或者换个更好发音的唤醒词。
-- 经常被电视/别人说话误唤醒：把 `fuzzy` 提到 `0.85~0.9`，或者用更长的唤醒词（如“你好小助手”）。
-- 只想说一句话就执行：`require_wake = false`，或者临时加 `--no-wake`。
+Windows 的按键只会发给**当前前台窗口**。如果你的终端占着焦点，`Ctrl+C` 就发给了终端。
+三种办法：
 
-**门限**
+1. 用 `focus` 动作先把目标窗口切到前台：
+
+```toml
+[[rules]]
+id = "save_in_notepad"
+name = "在记事本里保存"
+description = "先切到记事本再保存"
+phrases = ["记事本保存"]
+type = "sequence"
+steps = [
+    { type = "focus", title = "记事本" },
+    { type = "hotkey", keys = ["ctrl", "s"] },
+]
+```
+
+2. 说话时保证目标程序就在前台。
+3. 目标程序以**管理员身份**运行时，Windows 会阻止普通权限程序给它发模拟按键
+   （UIPI 限制）；这时只能让 `vc run` 也以管理员身份运行。
+
+## 唤醒词
+
+唤醒词用 **sherpa-onnx 的关键词检测（KWS）**，不是整句识别：它只判断“有没有人喊这几个词”，
+所以 CPU 占用很低，也不会把唤醒词之外的语音送去识别。
+
+程序会把中文唤醒词自动转成模型要的「声母 + 韵母」token：
+
+```text
+小助手     ->  x iǎo zh ù sh ǒu @小助手
+你好小助手  ->  n ǐ h ǎo x iǎo zh ù sh ǒu @你好小助手
+```
+
+改唤醒词只要改 `[wake] words`，下次运行会自动重建关键词文件。
+
+**调优建议**
+
+- 喊了没反应：`vc wake` 单独测；把 `threshold` 从 `0.25` 降到 `0.18`；换 2~4 个字的常见词。
+- 老是自己醒：把 `threshold` 提到 `0.35~0.5`；别用“好的”“嗯”这类常用词。
+- 只能纯中文唤醒词（当前中文模型）。要英文/中英混合唤醒，把 `model` 换成
+  `sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20` 并重新 `vc setup`（关键词 token 规则不同，
+  非中文唤醒词需要自己准备 keywords 文件）。
+
+## 大模型配置
+
+默认走**阿里云百炼（DashScope）的 OpenAI 兼容接口** + `qwen-audio-turbo-latest`：
+
+```toml
+[llm]
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+model = "qwen-audio-turbo-latest"
+api_key_env = "DASHSCOPE_API_KEY"
+```
+
+请求长这样（程序内部实现，无需你手写）：
+
+```json
+{
+  "model": "qwen-audio-turbo-latest",
+  "messages": [
+    {"role": "system", "content": "你是一个语音命令解析器……命令表……只输出 JSON"},
+    {"role": "user", "content": [
+      {"type": "input_audio", "input_audio": {"data": "data:;base64,UklGR…", "format": "wav"}},
+      {"type": "text", "text": "请解析这段语音，并按格式返回 JSON。"}
+    ]}
+  ],
+  "temperature": 0,
+  "response_format": {"type": "json_object"}
+}
+```
+
+**换更聪明的模型**：`qwen3-omni-flash`、`qwen-omni-turbo-latest` 等支持音频输入的模型都可以；
+若接口报“模型不支持音频输入”，用 `vc doctor` 能看到服务端原文，换一个模型名即可。
+
+**换成别的服务**：任何兼容 OpenAI `chat/completions` 且支持 `input_audio` 的服务都能用
+（自建 vLLM / Ollama 跑 Qwen2-Audio 之类也一样），只改 `base_url`、`model`、`api_key_env`。
+
+**成本与延迟**：一次命令 = 一次请求、1~2 秒音频、几百 token；`vc doctor` 会打印实际耗时。
+只说了唤醒词的那次不会发请求（程序在本地就把这段丢弃了）。
+
+## 麦克风与门限
 
 ```powershell
 uv run vc meter --seconds 15      # 说话时盯着电平看
 uv run vc calibrate --seconds 5   # 安静时测底噪
 ```
 
-- 说话时电平应该明显高于门限（正常说话通常是 0.02~0.15，门限在 0.004~0.02 之间）；
-- 一直没反应 → 门限太高或麦克风没收到声音：调小 `audio.noise_threshold`，或换 `audio.device`；
-- 老是误触发 → 调大 `noise_threshold` 或 `threshold_factor`，也可以把 `min_speech_ms` 提高到 400；
-- 校准期间最好保持“日常环境”（空调、风扇正常开着），但别说话、别敲键盘。
-
-## 换识别引擎（更准的模型）
-
-**Vosk 换大模型**（无需额外依赖，只是模型更大）：
-
-```powershell
-uv run vc setup --model vosk-model-cn-0.22     # 约 1.3GB，更准
-# 然后改 config.toml： asr.vosk_model = "vosk-model-cn-0.22"
-```
-
-**faster-whisper**（明显更准，代价是占用更大、CPU 上有延迟）：
-
-```powershell
-uv sync --extra whisper          # 安装可选依赖（ctranslate2 / onnxruntime 等）
-# config.toml：
-#   [asr] engine = "whisper"
-#         whisper_model = "small"          # 或 base / medium
-#         whisper_compute_type = "int8"    # CPU 用 int8；NVIDIA 显卡可 device="cuda" + float16
-#         hf_endpoint = "https://hf-mirror.com"   # 国内下载慢时
-uv run vc setup --engine whisper  # 提示模型会放在哪里
-```
-
-英文场景：`asr.vosk_model = "vosk-model-small-en-us-0.15"`、`general.language = "en"`，
-唤醒词换成英文（如 `["computer"]`）即可。
+- 说话电平通常 0.02~0.15，门限在 0.004~0.02 之间；说话时应明显高于门限。
+- 一直没反应 → 门限太高或麦克风没收到声音：调小 `noise_threshold`，或用 `vc devices` 换 `audio.device`。
+- 老是被环境噪音触发 → 调大 `noise_threshold`/`threshold_factor`，或把 `min_speech_ms` 提到 400。
+- 校准期间保持“日常环境”（空调风扇正常开），但别说话。
 
 ## 常见问题
 
-**Q：识别到文本了，但什么都没执行？**
-A：按顺序检查——① 是否说了唤醒词（或加 `--no-wake`）；② `vc rules` 里有没有对得上的触发词；
-③ 该动作类型是否在 `commands.allow` 白名单里；④ 是不是 400ms 冷却期内重复触发。
-用 `vc say "小助手 复制"` 能立刻看出是哪一步没对上。
+**Q：喊了唤醒词没反应？**
+A：`uv run vc wake` 单独测。依次检查：`vc meter` 有没有电平 → 说的是不是配置里的唤醒词 →
+把 `wake.threshold` 降到 0.18 → 换个更好发音的唤醒词。
 
-**Q：一直没反应？**
-A：`vc meter` 看说话时电平有没有超过门限；`vc devices` 确认设备对不对；
-`uv run vc run --config 你的config.toml` 时留意启动横幅里的“静音门限”和“输入设备”。
+**Q：唤醒后说了话，但什么都没执行？**
+A：`vc doctor` 会一次性检查配置、Key、模型、关键词，并真实调用一次大模型。再按下面顺序看：
+① 有没有说完整（唤醒后 `wait_ms` 内要开口）；② 命令表里有没有对应说法，必要时补充
+`description` 和 `phrases` 示例；③ 动作类型是否在 `commands.allow` 里；④ 是不是发给了错误的前台窗口（见 `focus`）。
 
-**Q：`uv sync` 报 vosk 依赖 `srt` 构建失败？**
-A：`srt` 在 PyPI 上只有源码包，`uv`/`pip` 会本地构建它（纯 Python，很快）。
-如果因为所在环境的限制构建失败，可以手动 `uv pip install srt` 或 `python -m pip install srt` 后再
-`uv sync --no-build-isolation`。
+**Q：日志里显示“模型没有匹配到任何命令”？**
+A：模型听到了（会打印 `transcript`），但命令表里没有合适的命令。往 `[[rules]]` 里加一条，
+或者把这条命令的 `description`/`phrases` 写得更贴近你的说法。
 
-**Q：中文输入没反应 / 只有英文字母？**
-A：文字输入走 `SendInput` 的 Unicode 模式，需要有一个可接收键盘输入的前台窗口，
-且不能是被管理员权限保护、或独占键盘的程序。个别游戏（DirectInput）不接收这种输入。
+**Q：接口报 400 / 401 / 404？**
+A：400 多为模型不支持音频输入（换 `llm.model`）；401 是 Key 无效或没读到
+（检查 `api_key_env` 指向的环境变量）；404 是 `base_url`/`model` 写错。`vc doctor` 会打印服务端原文。
 
-**Q：快捷键在某个程序里无效？**
-A：如果那个程序以管理员身份运行，Windows 会阻止普通权限进程向它发送按键。
-此时只能让 `vc run` 也以管理员身份运行（请同时确认规则里没有危险动作）。
+**Q：能不能完全离线？**
+A：唤醒词和“有没有说话”本来就是离线的；命令理解需要联网（或你自己在内网起一个兼容
+OpenAI 接口的多模态模型，把 `base_url` 指过去）。如果大模型不可用，程序会明确报错，不会乱猜。
 
-**Q：怎么临时停用一条规则？**
-A：给那条 `[[rules]]` 加 `enabled = false`，然后 `vc rules --all` 能看到它被标记为“已停用”。
+**Q：中文输入没反应？**
+A：文字输入走 Windows `SendInput` 的 Unicode 模式，需要有一个能接收键盘输入的前台窗口。
+如果目标程序以管理员权限运行，普通权限的程序无法给它发按键（UIPI），此时要么以管理员身份
+运行 `vc run`，要么就别在那个程序里用语音控制。
 
-**Q：模型下载太慢？**
-A：Vosk 模型可手动从 <https://alphacephei.com/vosk/models> 下载 zip，解压到 `models/` 目录即可
-（目录里应当出现 `am/`、`conf/` 等子目录）。
+**Q：组合键“看起来执行了”但目标程序没反应？**
+A：同上，先确认前台窗口对不对（用 `--dry-run` 看命中的动作，再看 `focus` 是否成功）。
+`focus` 受 Windows 前台窗口锁限制，个别情况下会提示“没能切到前台”，先手动点一下目标窗口即可。
+
+**Q：日志显示 `[OK] hotkey: ctrl+c`，但目标程序一点反应都没有？**
+A：先跑一次 `uv run vc keytest --cross-app`（会倒计时给你时间切到记事本）。模拟按键
+Windows 只发给**当前前台窗口**，而且有三种情况会被“成功但无效”地拦下来：
+
+| `vc keytest` 告诉你 | 原因 | 怎么办 |
+| --- | --- | --- |
+| `进程完整性级别：Low` | 命令跑在**受限沙箱**里，Windows 的 UIPI 会静默丢掉模拟按键（`SendInput` 返回成功） | 换成普通终端（直接开 Windows Terminal / PowerShell）运行 `vc run`，不要在沙箱终端里跑 |
+| 前台窗口是别的程序（终端、浏览器…） | 按键发给了前台窗口，不是你想操作的程序 | 说话时让目标程序保持在前台；或在规则第一步加 `{ type = "focus", title = "记事本" }` |
+| 前台窗口所属进程完整性是 `High` | 目标程序以**管理员身份**运行，普通权限发不进按键 | 让 `vc run` 也以管理员身份运行 |
+
+`vc run` 启动时的横幅里也会直接提示“运行在受限沙箱里”，`vc doctor` 同样会报这一项。
+
+**Q：`uv sync` / `uv run` 报 `PermissionError: ...\uv\cache\builds-v0\.tmpXXXX\get_requires_for_build_editable.txt`？**
+A：uv 想写它的全局缓存 `%LOCALAPPDATA%\uv\cache`，但当前命令跑在**受限环境**里
+（进程是低完整性级别，只能写工作区），所以被拒绝。**普通终端里不会出现这个问题**——
+换个窗口（Win+R → `wt`）重跑即可。确实要在受限环境里装依赖时，临时把缓存指到工作区：
+
+```powershell
+$env:UV_CACHE_DIR = "$PWD\.uv-cache"                 # 缓存放进工作区
+$env:UV_PYTHON_INSTALL_DIR = "$PWD\.uv-python"       # 需要下载 Python 时也要指到工作区
+uv sync
+```
+
+想对这个项目永久生效，可以在项目根目录放一个 `uv.toml`（会让本项目的 uv 缓存落在项目目录里，
+而不是 `%LOCALAPPDATA%`）：
+
+```toml
+cache-dir = ".uv-cache"
+```
+
+只想跳过重新构建、直接跑（虚拟环境已经装好时）：
+
+```powershell
+uv run --no-sync vc run
+```
+
+**Q：`uv sync` 报 sherpa-onnx 相关错误？**
+A：本项目显式声明了 `sherpa-onnx-core`（原生库，含 onnxruntime），版本必须和 `sherpa-onnx` 一致；
+升级其中一个时请同步另一个的版本号。
 
 ## 安全说明
 
-- `shell` 动作默认被 `commands.allow_shell = false` 拦住，即使写了规则也不会执行；
-- 动作类型还受 `commands.allow` 白名单限制，删掉 `shell` 更保险；
-- 调试期间用 `--dry-run`，只显示要做什么，不动系统；
-- 不建议让 `vc run` 常驻管理员权限；如果确实需要，请只保留你完全信任的规则；
-- 所有识别都在本地完成，音频不会离开你的电脑。
+- 模型只能返回命令表里的 `id`，其他一律拒绝（日志会写明“已拒绝执行”）。
+- `shell` 动作默认被 `commands.allow_shell = false` 拦住；动作类型还受 `commands.allow` 白名单限制。
+- 调试用 `--dry-run`：只显示要做什么，不动系统。
+- 建议用环境变量存 API Key，不要把 key 写进 `config.toml`（该文件已在 `.gitignore` 里）。
+- 不建议让 `vc run` 常驻管理员权限；确实需要时，请只保留你完全信任的命令。
 
 ## 项目结构与开发
 
@@ -389,42 +383,36 @@ A：Vosk 模型可手动从 <https://alphacephei.com/vosk/models> 下载 zip，�
 ds_voicecontrol/
 ├─ pyproject.toml              # 依赖、入口点 vc、pytest 配置
 ├─ config.toml                 # 你的配置（vc init 生成，已 gitignore）
-├─ models/                     # 识别模型（vc setup 下载，已 gitignore）
+├─ models/                     # 唤醒词模型 + 自动生成的 wake-keywords.txt
 ├─ src/voice_control/
 │  ├─ cli.py                   # 命令行子命令
 │  ├─ config.py                # TOML 读写 + 校验
 │  ├─ config_default.py        # 带注释的默认配置模板
-│  ├─ audio.py                 # 麦克风、底噪统计、分段（VAD-lite）
-│  ├─ asr/                     # 识别后端：vosk / whisper
-│  ├─ models.py                # 模型下载与查找
-│  ├─ matching.py              # 归一化、唤醒词、口令匹配
-│  ├─ actions.py               # 动作执行（pynput + SendInput）
-│  ├─ listener.py              # 主循环 & 状态机
+│  ├─ audio.py                 # 麦克风、底噪校准、说话分段、音量门限
+│  ├─ kws.py                   # 本地唤醒词（拼音转 token、关键词文件、关键词检测）
+│  ├─ models.py                # 唤醒词模型下载/查找
+│  ├─ llm.py                   # 大模型：命令表提示词、audio 请求、JSON 决策解析与校验
+│  ├─ actions.py               # 动作执行（pynput 按键 + SendInput 中文输入 + focus 窗口）
+│  ├─ matching.py              # 文本归一化与本地兜底匹配
+│  ├─ listener.py              # 状态机：listening → waiting → capturing → 决策 → 执行
 │  └─ ui.py                    # 终端输出
-└─ tests/                      # 67 个单元测试
+└─ tests/                      # 单元测试（含一个本地假大模型接口）
 ```
-
-开发常用命令：
 
 ```powershell
-uv run pytest                                   # 跑测试
-uv run pytest tests/test_matching.py -q         # 只跑匹配相关
-uv run vc say "小助手 音量加" --dry-run           # 不改配置直接验证口令
-uv run vc run --wav 某段录音.wav --dry-run       # 用真实音频验证整条链路
+uv run pytest                                     # 跑测试
+uv run pytest tests/test_llm.py -q                # 只跑大模型接入层
+uv run vc say "把音量调小一点" --dry-run            # 不改配置直接验证命令表
+uv run vc run --wav 录音.wav --dry-run             # 用真实音频验证整条链路
 ```
 
-调试识别问题时，把 `[general] log_level = "debug"`，运行时会打印每段音频的时长、
-有效说话时长和峰值电平，方便判断是“没检测到说话”还是“识别错了”。
+调试技巧：`[general] log_level = "debug"`，`[llm] save_audio_dir = "debug-audio"`，
+可以把每次发给模型的语音存下来，用播放器听一遍就知道模型听到了什么。
 
 ## 已知限制与后续方向
 
-- 唤醒靠识别文本匹配，不是专用低功耗唤醒引擎；嘈杂环境或电视声可能误唤醒。
-  后续可以接 openWakeWord / Porcupine 做专用唤醒，把 CPU 占用再降一个量级。
-- 一次只处理一句话，没有多轮对话上下文。
-- 目前不会“切到某个已打开的窗口”，`app` 动作只会启动/打开目标，不会激活已有窗口。
-- 鼠标动作、自定义正则触发词、图形化配置界面都还没有。
-- 非 Windows 平台可以跑（pynput 兜底），但中文文字输入依赖 Windows API。
-
----
-
-MIT License.
+- 命令理解依赖网络（或自建兼容接口）；离线时只有唤醒和“有没有说话”可用。
+- 唤醒词是“喊一声就开窗”，不支持连续对话；每次命令都要先喊唤醒词。
+- 一次只处理一句话，没有上下文记忆（比如“再大一点”这种指代需要自己写进 `description`）。
+- `focus` 受 Windows 前台窗口限制，个别情况下需要先手动点一下目标窗口。
+- 后续可做：连续对话模式、把常用命令做成托盘菜单、本地小模型做“免联网”的降级、鼠标动作。

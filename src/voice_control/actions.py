@@ -1,19 +1,24 @@
-"""动作执行：把口令规则里的动作变成真实的按键 / 程序操作。
+"""动作执行：把命令表里的动作变成真实的按键 / 程序操作。
 
 支持的动作类型（和配置里的 type 对应）：
 
 * ``hotkey``   组合键，例如 ctrl+c（先按修饰键，再点主键）
 * ``press``    依次按下的键，可重复（repeat / interval_ms）
-* ``text``     直接输入文字，支持 CJK（Windows 下用 SendInput 的 Unicode 模式，
-               不依赖输入法，也不受键盘布局影响）
+* ``text``     直接输入文字，支持槽位 ``{query}`` 和中文
 * ``app``      打开程序、文件或网址
+* ``focus``    把标题匹配的窗口切到前台（按键发错窗口时很有用）
 * ``wait``     等待若干毫秒
 * ``shell``    执行命令行（默认被 commands.allow_shell = false 拦住）
 * ``sequence`` 组合动作，按顺序执行
+
+Windows 下按键和文字都用同一套 ``SendInput`` 实现（``VK`` 码给组合键、``KEYEVENTF_UNICODE``
+给任意字符），因此不依赖输入法、也不受键盘布局影响；只导入一次 user32，避免多个库互相覆盖
+``argtypes`` 导致 ``expected LP_INPUT instance`` 这类错误。其它平台用 pynput 兜底（可选依赖）。
 """
 
 from __future__ import annotations
 
+import ctypes
 import datetime as _dt
 import os
 import re
@@ -27,89 +32,268 @@ from typing import Any, Sequence
 
 from .config import ACTION_TYPES
 
-MODIFIER_ALIASES = {
-    "ctrl": "ctrl",
-    "control": "ctrl",
-    "alt": "alt",
-    "shift": "shift",
-    "win": "cmd",
-    "windows": "cmd",
-    "cmd": "cmd",
-    "super": "cmd",
-    "meta": "cmd",
+# --------------------------------------------------------------------------- #
+# 虚拟键码表
+# --------------------------------------------------------------------------- #
+VK_CODES: dict[str, int] = {
+    # 修饰键
+    "ctrl": 0x11,
+    "control": 0x11,
+    "alt": 0x12,
+    "shift": 0x10,
+    "win": 0x5B,
+    "windows": 0x5B,
+    "cmd": 0x5B,
+    "super": 0x5B,
+    "meta": 0x5B,
+    # 常用
+    "enter": 0x0D,
+    "return": 0x0D,
+    "回车": 0x0D,
+    "esc": 0x1B,
+    "escape": 0x1B,
+    "tab": 0x09,
+    "space": 0x20,
+    "空格": 0x20,
+    "backspace": 0x08,
+    "delete": 0x2E,
+    "del": 0x2E,
+    "insert": 0x2D,
+    "ins": 0x2D,
+    "home": 0x24,
+    "end": 0x23,
+    "pageup": 0x21,
+    "pgup": 0x21,
+    "page_up": 0x21,
+    "pagedown": 0x22,
+    "pgdn": 0x22,
+    "page_down": 0x22,
+    "up": 0x26,
+    "down": 0x28,
+    "left": 0x25,
+    "right": 0x27,
+    "capslock": 0x14,
+    "caps_lock": 0x14,
+    "numlock": 0x90,
+    "num_lock": 0x90,
+    "printscreen": 0x2C,
+    "print_screen": 0x2C,
+    "scrolllock": 0x91,
+    "scroll_lock": 0x91,
+    "pause": 0x13,
+    "menu": 0x5D,
+    # 媒体键
+    "volumeup": 0xAF,
+    "volume_up": 0xAF,
+    "volumedown": 0xAE,
+    "volume_down": 0xAE,
+    "mute": 0xAD,
+    "volume_mute": 0xAD,
+    "playpause": 0xB3,
+    "play_pause": 0xB3,
+    "nexttrack": 0xB0,
+    "next": 0xB0,
+    "prevtrack": 0xB1,
+    "previous": 0xB1,
+    "stop": 0xB2,
 }
 
-SPECIAL_ALIASES = {
-    "enter": "enter",
-    "return": "enter",
-    "回车": "enter",
-    "esc": "esc",
-    "escape": "esc",
-    "space": "space",
-    "空格": "space",
-    "tab": "tab",
-    "backspace": "backspace",
-    "delete": "delete",
-    "del": "delete",
-    "insert": "insert",
-    "ins": "insert",
-    "home": "home",
-    "end": "end",
-    "pageup": "page_up",
-    "pgup": "page_up",
-    "page_up": "page_up",
-    "pagedown": "page_down",
-    "pgdn": "page_down",
-    "page_down": "page_down",
-    "up": "up",
-    "down": "down",
-    "left": "left",
-    "right": "right",
-    "capslock": "caps_lock",
-    "caps_lock": "caps_lock",
-    "numlock": "num_lock",
-    "num_lock": "num_lock",
-    "printscreen": "print_screen",
-    "print_screen": "print_screen",
-    "scrolllock": "scroll_lock",
-    "scroll_lock": "scroll_lock",
-    "pause": "pause",
-    "menu": "menu",
-    "volumeup": "media_volume_up",
-    "volume_up": "media_volume_up",
-    "volumedown": "media_volume_down",
-    "volume_down": "media_volume_down",
-    "mute": "media_volume_mute",
-    "volume_mute": "media_volume_mute",
-    "playpause": "media_play_pause",
-    "play_pause": "media_play_pause",
-    "nexttrack": "media_next",
-    "next": "media_next",
-    "prevtrack": "media_previous",
-    "previous": "media_previous",
-    "stop": "media_stop",
+# 需要 KEYEVENTF_EXTENDEDKEY 的键（方向键、翻页、媒体键、Win 键等）
+EXTENDED_VKS = {
+    0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,  # PgUp/PgDn/End/Home/方向键
+    0x2C,  # PrintScreen
+    0x2D, 0x2E,  # Insert / Delete
+    0x5B, 0x5C, 0x5D,  # Win / Win / Menu
+    0x6F,  # 小键盘除号
+    0x90,  # NumLock
+    0xA3,  # 右 Ctrl
+    0xAD, 0xAE, 0xAF, 0xB0, 0xB1, 0xB2, 0xB3,  # 音量/媒体
 }
 
-_PLACEHOLDER = re.compile(r"\{([a-z_]+)\}")
-_URL_PREFIX = re.compile(r"^(https?|mailto|file)://", re.IGNORECASE)
+MODIFIER_VKS = {0x10, 0x11, 0x12, 0x5B, 0x5C}
+
+KEYEVENTF_EXTENDEDKEY = 0x0001
+KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_UNICODE = 0x0004
+INPUT_KEYBOARD = 1
+
+def known_key_names() -> list[str]:
+    names = sorted(VK_CODES)
+    return names + [f"f{i}" for i in range(1, 25)] + ["a-z", "0-9", "单个符号"]
+
+
+# --------------------------------------------------------------------------- #
+# 按键解析（纯逻辑，方便单测）
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class KeySpec:
+    """一个按键：``vk`` 走虚拟键码，``char`` 走 Unicode 事件。"""
+
+    kind: str  # "vk" | "char"
+    value: int  # vk 码或 Unicode 码点
+    shift: bool = False  # 该字符需要 Shift（例如 "+"、"?"）
+
+    @property
+    def is_modifier(self) -> bool:
+        return self.kind == "vk" and self.value in MODIFIER_VKS
+
+
+def resolve_key(name: str) -> KeySpec:
+    """把配置里的按键名解析成 :class:`KeySpec`。"""
+    raw = str(name).strip()
+    lowered = raw.lower()
+    if lowered in VK_CODES:
+        return KeySpec("vk", VK_CODES[lowered])
+    if re.fullmatch(r"f([1-9]|1[0-9]|2[0-4])", lowered):
+        return KeySpec("vk", 0x6F + int(lowered[1:]))  # F1 = 0x70
+    if len(raw) == 1:
+        return _char_spec(raw)
+    raise ActionError(f"不认识的按键名 “{name}”。可用：{', '.join(known_key_names())}")
+
+
+def _char_spec(char: str) -> KeySpec:
+    if os.name != "nt":  # pragma: no cover - 非 Windows 由 pynput 兜底
+        return KeySpec("char", ord(char))
+    if char.isascii() and char.isalnum():
+        return KeySpec("vk", ord(char.upper()))
+    user32 = _user32()
+    result = int(user32.VkKeyScanW(ctypes.c_wchar(char)))
+    if result == -1:
+        return KeySpec("char", ord(char))
+    vk = result & 0xFF
+    shift = bool((result >> 8) & 0x01)
+    return KeySpec("vk", vk, shift=shift)
+
+
+# --------------------------------------------------------------------------- #
+# Windows SendInput
+# --------------------------------------------------------------------------- #
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = (
+        ("wVk", ctypes.c_ushort),
+        ("wScan", ctypes.c_ushort),
+        ("dwFlags", ctypes.c_ulong),
+        ("time", ctypes.c_ulong),
+        ("dwExtraInfo", ctypes.c_void_p),
+    )
+
+
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = (
+        ("dx", ctypes.c_long),
+        ("dy", ctypes.c_long),
+        ("mouseData", ctypes.c_ulong),
+        ("dwFlags", ctypes.c_ulong),
+        ("time", ctypes.c_ulong),
+        ("dwExtraInfo", ctypes.c_void_p),
+    )
+
+
+class _HARDWAREINPUT(ctypes.Structure):
+    _fields_ = (
+        ("uMsg", ctypes.c_ulong),
+        ("wParamL", ctypes.c_ushort),
+        ("wParamH", ctypes.c_ushort),
+    )
+
+
+class _INPUTUNION(ctypes.Union):
+    _fields_ = (("mi", _MOUSEINPUT), ("ki", _KEYBDINPUT), ("hi", _HARDWAREINPUT))
+
+
+class _INPUT(ctypes.Structure):
+    _fields_ = (("type", ctypes.c_ulong), ("u", _INPUTUNION))
+
+
+_user32_handle: Any = None
+_sendinput_original: tuple[Any, Any] | None = None
+
+
+def _user32():
+    """初始化 user32，并记录 ``SendInput`` 原本的参数类型。
+
+    之所以要记录：其它同样调用 ``user32.SendInput`` 的库（各种按键/自动化工具）有的依赖
+    “不设 argtypes”。我们调用前后恢复原状，就不会出现
+    ``expected LP_INPUT instance`` 这类互相打架的错误。
+    """
+    global _user32_handle, _sendinput_original
+    if _user32_handle is None:
+        if os.name != "nt":  # pragma: no cover
+            raise ActionError("按键发送目前只支持 Windows")
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        _sendinput_original = (user32.SendInput.argtypes, user32.SendInput.restype)
+        user32.SendInput.argtypes = (
+            ctypes.c_uint,
+            ctypes.POINTER(_INPUT),
+            ctypes.c_int,
+        )
+        user32.SendInput.restype = ctypes.c_uint
+        _user32_handle = user32
+    return _user32_handle
+
+
+def _map_scan(vk: int) -> int:
+    try:
+        return int(_user32().MapVirtualKeyW(vk, 0)) & 0xFF  # MAPVK_VK_TO_VSC
+    except Exception:  # pragma: no cover
+        return 0
+
+
+def _vk_input(vk: int, up: bool) -> _INPUT:
+    flags = KEYEVENTF_KEYUP if up else 0
+    if vk in EXTENDED_VKS:
+        flags |= KEYEVENTF_EXTENDEDKEY
+    return _INPUT(type=INPUT_KEYBOARD, u=_INPUTUNION(ki=_KEYBDINPUT(vk, _map_scan(vk), flags, 0, None)))
+
+
+def _char_inputs(char: str, up: bool) -> list[_INPUT]:
+    """任意字符（含中文）走 KEYEVENTF_UNICODE，必要时用代理对表示。"""
+    code = ord(char)
+    units = [code] if code <= 0xFFFF else [0xD800 + ((code - 0x10000) >> 10), 0xDC00 + ((code - 0x10000) & 0x3FF)]
+    flags = KEYEVENTF_UNICODE | (KEYEVENTF_KEYUP if up else 0)
+    return [_INPUT(type=INPUT_KEYBOARD, u=_INPUTUNION(ki=_KEYBDINPUT(0, unit, flags, 0, None))) for unit in units]
+
+
+def send_events(events: Sequence[_INPUT]) -> None:
+    if not events:
+        return
+    user32 = _user32()
+    struct_size = ctypes.sizeof(_INPUT)
+    batch = 64
+    for start in range(0, len(events), batch):
+        chunk = list(events[start : start + batch])
+        array = (_INPUT * len(chunk))(*chunk)
+        sent = user32.SendInput(len(chunk), array, struct_size)
+        if not sent:
+            error = ctypes.get_last_error()
+            raise ActionError(
+                f"SendInput 发送失败（系统错误码 {error}）。"
+                "常见原因：目标窗口以管理员权限运行，或前台程序屏蔽了模拟按键。"
+            )
+        time.sleep(0.005)
+    # 用完恢复原样，避免干扰其它同样使用 SendInput 的库
+    if _sendinput_original is not None:
+        try:
+            user32.SendInput.argtypes, user32.SendInput.restype = _sendinput_original
+        except Exception:  # pragma: no cover
+            pass
 
 
 class ActionError(RuntimeError):
     """动作无法执行时抛出。"""
 
 
-def known_key_names() -> list[str]:
-    names = set(MODIFIER_ALIASES) | set(SPECIAL_ALIASES)
-    extras = [f"f{i}" for i in range(1, 21)] + ["a-z", "0-9", "单个符号"]
-    return sorted(names) + extras
-
-
+# --------------------------------------------------------------------------- #
+# 执行上下文
+# --------------------------------------------------------------------------- #
 @dataclass
 class ActionContext:
     """执行上下文：槽位文本、白名单、是否演练。"""
 
     dry_run: bool = False
     text: str = ""
+    slots: dict[str, str] = field(default_factory=dict)
+    declared_slots: Sequence[str] = ()
     allow: Sequence[str] = ACTION_TYPES
     allow_shell: bool = False
 
@@ -126,94 +310,6 @@ class ActionResult:
 
 
 # --------------------------------------------------------------------------- #
-# Windows Unicode 文本注入
-# --------------------------------------------------------------------------- #
-def _utf16_units(char: str) -> list[int]:
-    code = ord(char)
-    if code <= 0xFFFF:
-        return [code]
-    code -= 0x10000
-    return [0xD800 + (code >> 10), 0xDC00 + (code & 0x3FF)]
-
-
-def _send_unicode_windows(text: str) -> int:
-    """用 SendInput 的 KEYEVENTF_UNICODE 输入任意字符（含中文）。返回发送的事件数。"""
-    import ctypes
-    from ctypes import wintypes
-
-    ulong_ptr = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
-
-    class KEYBDINPUT(ctypes.Structure):
-        _fields_ = (
-            ("wVk", wintypes.WORD),
-            ("wScan", wintypes.WORD),
-            ("dwFlags", wintypes.DWORD),
-            ("time", wintypes.DWORD),
-            ("dwExtraInfo", ulong_ptr),
-        )
-
-    class MOUSEINPUT(ctypes.Structure):
-        _fields_ = (
-            ("dx", wintypes.LONG),
-            ("dy", wintypes.LONG),
-            ("mouseData", wintypes.DWORD),
-            ("dwFlags", wintypes.DWORD),
-            ("time", wintypes.DWORD),
-            ("dwExtraInfo", ulong_ptr),
-        )
-
-    class HARDWAREINPUT(ctypes.Structure):
-        _fields_ = (
-            ("uMsg", wintypes.DWORD),
-            ("wParamL", wintypes.WORD),
-            ("wParamH", wintypes.WORD),
-        )
-
-    class INPUTUNION(ctypes.Union):
-        _fields_ = (("mi", MOUSEINPUT), ("ki", KEYBDINPUT), ("hi", HARDWAREINPUT))
-
-    class INPUT(ctypes.Structure):
-        _fields_ = (("type", wintypes.DWORD), ("u", INPUTUNION))
-
-    keyeventf_keyup = 0x0002
-    keyeventf_unicode = 0x0004
-
-    events: list[Any] = []
-    for char in text:
-        units = _utf16_units(char)
-        for unit in units:
-            events.append(INPUT(type=1, u=INPUTUNION(ki=KEYBDINPUT(0, unit, keyeventf_unicode, 0, 0))))
-        for unit in reversed(units):
-            events.append(
-                INPUT(
-                    type=1,
-                    u=INPUTUNION(
-                        ki=KEYBDINPUT(0, unit, keyeventf_unicode | keyeventf_keyup, 0, 0)
-                    ),
-                )
-            )
-    if not events:
-        return 0
-
-    send_input = ctypes.windll.user32.SendInput
-    send_input.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
-    send_input.restype = wintypes.UINT
-
-    struct_size = ctypes.sizeof(INPUT)
-    batch = 64
-    sent_total = 0
-    for start in range(0, len(events), batch):
-        chunk = events[start : start + batch]
-        array = (INPUT * len(chunk))(*chunk)
-        sent = send_input(len(chunk), array, struct_size)
-        if not sent:
-            raise ActionError("SendInput 输入失败（可能被前台程序或权限策略拦截）")
-        sent_total += int(sent)
-        time.sleep(0.01)
-    return sent_total
-
-
-# --------------------------------------------------------------------------- #
 # 执行器
 # --------------------------------------------------------------------------- #
 @dataclass
@@ -221,7 +317,6 @@ class ActionExecutor:
     allow: Sequence[str] = ACTION_TYPES
     allow_shell: bool = False
     dry_run: bool = False
-    _controller: Any = field(default=None, init=False, repr=False)
 
     # -- 公共入口 ---------------------------------------------------------- #
     def execute(self, action: dict, context: ActionContext | None = None) -> list[ActionResult]:
@@ -248,7 +343,7 @@ class ActionExecutor:
             return [handler(action, ctx)]
         except ActionError as exc:
             return [ActionResult(False, kind, str(exc))]
-        except Exception as exc:  # pragma: no cover - 兜底，避免一条规则崩掉整个监听
+        except Exception as exc:  # pragma: no cover - 兜底，避免一条命令崩掉整个监听
             return [ActionResult(False, kind, f"{type(exc).__name__}: {exc}")]
 
     # -- 各动作 ------------------------------------------------------------ #
@@ -287,7 +382,7 @@ class ActionExecutor:
     def _do_text(self, action: dict, ctx: ActionContext) -> ActionResult:
         text = self._render(str(action.get("text", "")), ctx)
         if not text:
-            return ActionResult(False, "text", "渲染后的文本为空（可能是 {text} 槽位没有内容）")
+            return ActionResult(False, "text", "渲染后的文本为空（可能是 {槽位} 没有内容）")
         if ctx.dry_run:
             return ActionResult(True, "text", f"输入 {text!r}（演练，未真正输入）")
         self._type_text(text)
@@ -301,6 +396,15 @@ class ActionExecutor:
             return ActionResult(True, "app", f"打开 {target}（演练，未真正打开）")
         self._open_target(target, shell=bool(action.get("shell", False)), cwd=action.get("cwd"))
         return ActionResult(True, "app", f"打开 {target}")
+
+    def _do_focus(self, action: dict, ctx: ActionContext) -> ActionResult:
+        title = self._render(str(action.get("title", "")), ctx).strip()
+        if not title:
+            raise ActionError("focus 需要 title，例如 title = \"记事本\"")
+        if ctx.dry_run:
+            return ActionResult(True, "focus", f"激活标题包含 {title!r} 的窗口（演练）")
+        window = self._focus_window(title)
+        return ActionResult(True, "focus", f"已激活窗口：{window}")
 
     def _do_wait(self, action: dict, ctx: ActionContext) -> ActionResult:
         try:
@@ -343,9 +447,15 @@ class ActionExecutor:
     # -- 文本模板 ---------------------------------------------------------- #
     def _render(self, template: str, ctx: ActionContext) -> str:
         now = _dt.datetime.now()
+        declared = {str(name).lower() for name in ctx.declared_slots}
 
         def replace(match: re.Match[str]) -> str:
             key = match.group(1)
+            # 1) 模型填好的槽位优先（包括名叫 text 的槽位）
+            for name, value in ctx.slots.items():
+                if str(name).lower() == key:
+                    return str(value)
+            # 2) 内置占位符
             if key == "text":
                 return ctx.text
             if key == "date":
@@ -354,108 +464,96 @@ class ActionExecutor:
                 return now.strftime("%H:%M")
             if key == "datetime":
                 return now.strftime("%Y-%m-%d %H:%M")
+            # 3) 规则声明过、但模型没给的槽位 -> 空（宁可失败也不要输入 "{query}" 这种字面量）
+            if key in declared:
+                return ""
             return match.group(0)
 
         return _PLACEHOLDER.sub(replace, template)
 
     # -- 键盘 -------------------------------------------------------------- #
-    @property
-    def controller(self):
-        if self._controller is None:
-            try:
-                from pynput.keyboard import Controller
-            except Exception as exc:  # pragma: no cover
-                raise ActionError(f"无法加载键盘控制库 pynput：{exc}") from exc
-            self._controller = Controller()
-        return self._controller
-
-    @staticmethod
-    def _keyboard_module():
-        try:
-            from pynput import keyboard
-        except Exception as exc:  # pragma: no cover
-            raise ActionError(f"无法加载键盘控制库 pynput：{exc}") from exc
-        return keyboard
-
-    def _resolve_key(self, name: str):
-        keyboard = self._keyboard_module()
-        raw = str(name).strip()
-        lowered = raw.lower()
-        if lowered in MODIFIER_ALIASES:
-            return getattr(keyboard.Key, MODIFIER_ALIASES[lowered])
-        if lowered in SPECIAL_ALIASES:
-            attr = SPECIAL_ALIASES[lowered]
-            key = getattr(keyboard.Key, attr, None)
-            if key is None:
-                raise ActionError(f"当前 pynput 版本不支持按键 “{name}”")
-            return key
-        if len(raw) == 1:
-            return keyboard.KeyCode.from_char(raw.lower())
-        if re.fullmatch(r"f([1-9]|1[0-9]|2[0-4])", lowered):
-            key = getattr(keyboard.Key, lowered, None)
-            if key is None:
-                raise ActionError(f"当前 pynput 版本不支持按键 “{name}”")
-            return key
-        raise ActionError(
-            f"不认识的按键名 “{name}”。可用：{', '.join(known_key_names())}"
-        )
-
-    def _modifier_set(self) -> set:
-        keyboard = self._keyboard_module()
-        names = (
-            "ctrl",
-            "ctrl_l",
-            "ctrl_r",
-            "alt",
-            "alt_l",
-            "alt_r",
-            "alt_gr",
-            "shift",
-            "shift_l",
-            "shift_r",
-            "cmd",
-            "cmd_l",
-            "cmd_r",
-        )
-        return {getattr(keyboard.Key, name) for name in names if hasattr(keyboard.Key, name)}
-
     def _send_hotkey(self, keys: Sequence[str]) -> None:
-        resolved = [self._resolve_key(key) for key in keys]
-        modifiers = self._modifier_set()
-        mods = [key for key in resolved if key in modifiers]
-        mains = [key for key in resolved if key not in modifiers]
+        if os.name != "nt":  # pragma: no cover - 非 Windows 兜底
+            self._send_hotkey_fallback(keys)
+            return
+        specs = [resolve_key(key) for key in keys]
+        mods: list[KeySpec] = [spec for spec in specs if spec.is_modifier]
+        mains: list[KeySpec] = [spec for spec in specs if not spec.is_modifier]
         if not mains and mods:
             mains = [mods.pop()]
-        controller = self.controller
+        # 字符需要 Shift（例如 "+"）时自动补上
+        if any(spec.shift for spec in mains) and not any(spec.value == 0x10 for spec in mods):
+            mods.append(KeySpec("vk", 0x10))
+
+        events: list[_INPUT] = []
         for mod in mods:
-            controller.press(mod)
-        try:
-            for key in mains:
-                controller.press(key)
-                controller.release(key)
-        finally:
-            for mod in reversed(mods):
-                controller.release(mod)
+            events.append(_vk_input(mod.value, up=False))
+        for main in mains:
+            if main.kind == "char":
+                events.extend(_char_inputs(chr(main.value), up=False))
+                events.extend(_char_inputs(chr(main.value), up=True))
+            else:
+                events.append(_vk_input(main.value, up=False))
+                events.append(_vk_input(main.value, up=True))
+        for mod in reversed(mods):
+            events.append(_vk_input(mod.value, up=True))
+        send_events(events)
 
     def _tap(self, name: str) -> None:
-        key = self._resolve_key(name)
-        controller = self.controller
-        controller.press(key)
-        controller.release(key)
+        if os.name != "nt":  # pragma: no cover
+            self._tap_fallback(name)
+            return
+        spec = resolve_key(name)
+        if spec.kind == "char":
+            send_events(_char_inputs(chr(spec.value), up=False) + _char_inputs(chr(spec.value), up=True))
+            return
+        events = [_vk_input(spec.value, up=False), _vk_input(spec.value, up=True)]
+        if spec.shift:
+            events = [_vk_input(0x10, up=False), *events, _vk_input(0x10, up=True)]
+        send_events(events)
 
     def _type_text(self, text: str) -> None:
-        if os.name == "nt":
-            for index, chunk in enumerate(text.split("\n")):
-                if index:
-                    self._tap("enter")
-                if chunk:
-                    _send_unicode_windows(chunk)
+        """输入文字：中文/任意字符走 KEYEVENTF_UNICODE，不依赖输入法与键盘布局。"""
+        if os.name != "nt":  # pragma: no cover - 非 Windows 兜底
+            self._type_text_fallback(text)
             return
-        # 非 Windows：交给 pynput（受键盘布局限制，但至少能用）
+        events: list[_INPUT] = []
+        for index, chunk in enumerate(text.split("\n")):
+            if index:
+                events.append(_vk_input(0x0D, up=False))
+                events.append(_vk_input(0x0D, up=True))
+            for char in chunk:
+                events.extend(_char_inputs(char, up=False))
+                events.extend(_char_inputs(char, up=True))
+        send_events(events)
+
+    # -- 非 Windows 兜底（可选依赖 pynput） -------------------------------- #
+    @staticmethod
+    def _pynput_controller():  # pragma: no cover - 只在非 Windows 用到
         try:
-            self.controller.type(text)
-        except Exception as exc:  # pragma: no cover
-            raise ActionError(f"输入文本失败：{exc}") from exc
+            from pynput.keyboard import Controller
+        except Exception as exc:
+            raise ActionError(
+                "非 Windows 平台需要安装 pynput 才能发送按键：uv sync --extra pynput"
+            ) from exc
+        return Controller()
+
+    def _send_hotkey_fallback(self, keys: Sequence[str]) -> None:  # pragma: no cover
+        controller = self._pynput_controller()
+        for key in keys[:-1]:
+            controller.press(key if len(key) > 1 else key)
+        controller.press(keys[-1])
+        controller.release(keys[-1])
+        for key in reversed(keys[:-1]):
+            controller.release(key)
+
+    def _tap_fallback(self, name: str) -> None:  # pragma: no cover
+        controller = self._pynput_controller()
+        controller.press(name)
+        controller.release(name)
+
+    def _type_text_fallback(self, text: str) -> None:  # pragma: no cover
+        self._pynput_controller().type(text)
 
     # -- 打开目标 ---------------------------------------------------------- #
     def _open_target(self, target: str, shell: bool = False, cwd: Any = None) -> None:
@@ -477,3 +575,333 @@ class ActionExecutor:
             raise ActionError(f"找不到可执行文件 “{target}”") from exc
         except OSError as exc:
             raise ActionError(f"打开 “{target}” 失败：{exc}") from exc
+
+    # -- 窗口激活 ---------------------------------------------------------- #
+    def _focus_window(self, title: str) -> str:
+        """把标题里包含 ``title`` 的窗口切到前台（只支持 Windows）。"""
+        if os.name != "nt":
+            raise ActionError("focus 动作目前只支持 Windows")
+        from ctypes import wintypes
+
+        user32 = _user32()
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        wanted = title.lower()
+        matches: list[tuple[int, str]] = []
+
+        enum_proc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+
+        def callback(hwnd, _lparam):  # type: ignore[no-untyped-def]
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length <= 0:
+                return True
+            buffer = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buffer, length + 1)
+            name = buffer.value
+            if wanted in name.lower():
+                matches.append((int(hwnd), name))
+            return True
+
+        user32.EnumWindows(enum_proc(callback), 0)
+        if not matches:
+            raise ActionError(
+                f"没有找到标题里包含 “{title}” 的窗口。"
+                "（focus 只匹配可见窗口的标题，可以用任务管理器确认窗口标题）"
+            )
+        hwnd, name = matches[0]
+        if user32.IsIconic(hwnd):
+            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        target_thread = user32.GetWindowThreadProcessId(hwnd, None)
+        current_thread = kernel32.GetCurrentThreadId()
+        attached = False
+        if target_thread and target_thread != current_thread:
+            attached = bool(user32.AttachThreadInput(current_thread, target_thread, True))
+        try:
+            user32.BringWindowToTop(hwnd)
+            ok = user32.SetForegroundWindow(hwnd)
+            if not ok:
+                # 前台窗口有锁，用最小化+还原或 SwitchToThisWindow 再试
+                user32.ShowWindow(hwnd, 6)  # SW_MINIMIZE
+                user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+                ok = user32.SetForegroundWindow(hwnd)
+            if not ok:
+                try:
+                    user32.SwitchToThisWindow(hwnd, True)
+                    ok = int(user32.GetForegroundWindow()) == hwnd
+                except Exception:  # pragma: no cover
+                    ok = False
+        finally:
+            if attached:
+                user32.AttachThreadInput(current_thread, target_thread, False)
+        if not ok:
+            raise ActionError(
+                f"找到窗口 “{name}” 但没能切到前台（Windows 限制后台程序抢焦点）。"
+                "可以先手动点一下该窗口，或让这个程序以管理员身份运行后再试。"
+            )
+        return name
+
+
+_PLACEHOLDER = re.compile(r"\{([a-z_]+)\}")
+_URL_PREFIX = re.compile(r"^(https?|mailto|file)://", re.IGNORECASE)
+
+
+# --------------------------------------------------------------------------- #
+# 完整性级别诊断（判断“为什么按键没生效”）
+# --------------------------------------------------------------------------- #
+def _integrity_name(rid: int) -> str:
+    if rid < 0x1000:
+        return "Untrusted"
+    if rid < 0x2000:
+        return "Low"
+    if rid < 0x3000:
+        return "Medium"
+    if rid < 0x4000:
+        return "High"
+    if rid < 0x5000:
+        return "System"
+    return "Protected"
+
+
+def _token_integrity(token: Any) -> str:
+    """从访问令牌里读完整性级别（Low 说明进程在受限沙箱里）。"""
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    advapi32.GetTokenInformation.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.POINTER(ctypes.c_ulong),
+    )
+    advapi32.GetSidSubAuthorityCount.argtypes = (ctypes.c_void_p,)
+    advapi32.GetSidSubAuthorityCount.restype = ctypes.POINTER(ctypes.c_ubyte)
+    advapi32.GetSidSubAuthority.argtypes = (ctypes.c_void_p, ctypes.c_ulong)
+    advapi32.GetSidSubAuthority.restype = ctypes.POINTER(ctypes.c_ulong)
+
+    class SID_AND_ATTRIBUTES(ctypes.Structure):
+        _fields_ = (("Sid", ctypes.c_void_p), ("Attributes", ctypes.c_ulong))
+
+    class TOKEN_MANDATORY_LABEL(ctypes.Structure):
+        _fields_ = (("Label", SID_AND_ATTRIBUTES),)
+
+    size = ctypes.c_ulong()
+    token_integrity_level = 25  # TokenIntegrityLevel
+    advapi32.GetTokenInformation(token, token_integrity_level, None, 0, ctypes.byref(size))
+    buffer = ctypes.create_string_buffer(size.value or 64)
+    if not advapi32.GetTokenInformation(
+        token, token_integrity_level, buffer, size.value, ctypes.byref(size)
+    ):
+        return "Unknown"
+    label = ctypes.cast(buffer, ctypes.POINTER(TOKEN_MANDATORY_LABEL)).contents
+    count = advapi32.GetSidSubAuthorityCount(label.Label.Sid)
+    if not count:
+        return "Unknown"
+    rid = advapi32.GetSidSubAuthority(label.Label.Sid, count.contents.value - 1)
+    if not rid:
+        return "Unknown"
+    return _integrity_name(int(rid.contents.value))
+
+
+def process_integrity_level() -> str:
+    """当前进程的完整性级别：Low / Medium / High / System …"""
+    if os.name != "nt":
+        return "Unknown"
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32.OpenProcessToken.argtypes = (
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.HANDLE),
+    )
+    token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), 0x0008, ctypes.byref(token)):
+        return "Unknown"
+    try:
+        return _token_integrity(token)
+    finally:
+        kernel32.CloseHandle(token)
+
+
+def window_process_id(hwnd: int) -> int:
+    """窗口所属进程的 PID（拿不到返回 0）。"""
+    if os.name != "nt" or not hwnd:
+        return 0
+    from ctypes import wintypes
+
+    user32 = _user32()
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return int(pid.value)
+
+
+def window_integrity_level(hwnd: int) -> str:
+    """某个窗口所属进程的完整性级别（拿不到就返回 Unknown）。"""
+    if os.name != "nt" or not hwnd:
+        return "Unknown"
+    from ctypes import wintypes
+
+    user32 = _user32()
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    process_query_limited_information = 0x1000
+
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    if not pid.value:
+        return "Unknown"
+    process = kernel32.OpenProcess(process_query_limited_information, False, pid.value)
+    if not process:
+        return "Unknown"
+    token = wintypes.HANDLE()
+    try:
+        if not advapi32.OpenProcessToken(process, 0x0008, ctypes.byref(token)):
+            return "Unknown"
+        try:
+            return _token_integrity(token)
+        finally:
+            kernel32.CloseHandle(token)
+    finally:
+        kernel32.CloseHandle(process)
+
+
+def foreground_window() -> tuple[int, str]:
+    """返回 (窗口句柄, 标题)。"""
+    if os.name != "nt":
+        return 0, ""
+    user32 = _user32()
+    hwnd = int(user32.GetForegroundWindow() or 0)
+    if not hwnd:
+        return 0, ""
+    length = user32.GetWindowTextLengthW(hwnd)
+    buffer = ctypes.create_unicode_buffer(length + 1)
+    user32.GetWindowTextW(hwnd, buffer, length + 1)
+    return hwnd, buffer.value
+
+
+def integrity_via_whoami(timeout: float = 5.0) -> str:
+    """用系统自带的 whoami 独立校验一次完整性级别（避免只信我们自己读的令牌）。
+
+    解析 SID（``S-1-16-<rid>``）而不是文字，避免不同语言/版本的显示差异。
+    """
+    if os.name != "nt":
+        return "Unknown"
+    try:
+        result = subprocess.run(
+            ["whoami", "/groups", "/fo", "csv", "/nh"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except Exception:  # pragma: no cover - whoami 不可用时静默降级
+        return "Unknown"
+    if result.returncode != 0:
+        return "Unknown"
+    match = re.search(r"S-1-16-(\d+)", result.stdout or "")
+    if not match:
+        return "Unknown"
+    return _integrity_name(int(match.group(1)))
+
+
+class _PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = (
+        ("dwSize", ctypes.c_ulong),
+        ("cntUsage", ctypes.c_ulong),
+        ("th32ProcessID", ctypes.c_ulong),
+        ("th32DefaultHeapID", ctypes.c_void_p),
+        ("th32ModuleID", ctypes.c_ulong),
+        ("cntThreads", ctypes.c_ulong),
+        ("th32ParentProcessID", ctypes.c_ulong),
+        ("pcPriClassBase", ctypes.c_long),
+        ("dwFlags", ctypes.c_ulong),
+        ("szExeFile", ctypes.c_wchar * 260),
+    )
+
+
+def process_integrity_by_pid(pid: int) -> str:
+    """查询任意进程的完整性级别（拿不到返回 Unknown）。"""
+    if os.name != "nt" or not pid:
+        return "Unknown"
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    process_query_limited_information = 0x1000
+    process = kernel32.OpenProcess(process_query_limited_information, False, pid)
+    if not process:
+        return "Unknown"
+    token = wintypes.HANDLE()
+    try:
+        if not advapi32.OpenProcessToken(process, 0x0008, ctypes.byref(token)):
+            return "Unknown"
+        try:
+            return _token_integrity(token)
+        finally:
+            kernel32.CloseHandle(token)
+    finally:
+        kernel32.CloseHandle(process)
+
+
+def process_parent_chain(max_depth: int = 8) -> list[str]:
+    """返回当前进程往上的启动链，每一层带上它自己的完整性级别。
+
+    例如 ``['python.exe(1234)[Low]', 'pwsh.exe(5678)[Medium]', ...]``。
+    用来回答“我这个终端到底是谁启动的、权限是在哪一层被降下来的”。
+    """
+    if os.name != "nt":
+        return []
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+        snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)  # TH32CS_SNAPPROCESS
+        if not snapshot or snapshot == ctypes.c_void_p(-1).value:
+            return []
+        try:
+            entry = _PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+            parents: dict[int, tuple[int, str]] = {}
+            if not kernel32.Process32FirstW(ctypes.c_void_p(snapshot), ctypes.byref(entry)):
+                return []
+            while True:
+                parents[int(entry.th32ProcessID)] = (
+                    int(entry.th32ParentProcessID),
+                    str(entry.szExeFile),
+                )
+                if not kernel32.Process32NextW(ctypes.c_void_p(snapshot), ctypes.byref(entry)):
+                    break
+        finally:
+            kernel32.CloseHandle(ctypes.c_void_p(snapshot))
+
+        chain: list[str] = []
+        pid = os.getpid()
+        for _ in range(max_depth):
+            info = parents.get(pid)
+            if info is None:
+                chain.append(f"<pid {pid} 已退出/不可见>")
+                break
+            parent_pid, name = info
+            chain.append(f"{name}({pid})[{process_integrity_by_pid(pid)}]")
+            if parent_pid in (0, pid):
+                break
+            if parent_pid not in parents:
+                chain.append(f"<pid {parent_pid} 已退出/不可见>")
+                break
+            pid = parent_pid
+        return chain
+    except Exception:  # pragma: no cover
+        return []
+
+
+def chain_looks_like_interactive_shell(chain: list[str]) -> bool:
+    """启动链里能看到资源管理器/终端宿主，才像是“人自己在终端里敲的”。"""
+    markers = (
+        "explorer.exe",
+        "windowsterminal.exe",
+        "wt.exe",
+        "conhost.exe",
+        "cmd.exe",
+        "powershell.exe",
+        "pwsh.exe",
+    )
+    return any(marker in link.lower() for link in chain for marker in markers)

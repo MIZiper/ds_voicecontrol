@@ -1,23 +1,28 @@
 [project]
 name = "ds-voicecontrol"
-version = "0.1.0"
-description = "本地语音控制工具：唤醒词唤醒 -> 离线语音识别 -> 口令匹配 -> 系统快捷键/操作"
+version = "0.2.0"
+description = "本地语音控制：本地听唤醒词 + 判断说话，语音交给大模型选命令，本地执行快捷键/操作"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "ds_voicecontrol" }]
-keywords = ["voice", "asr", "vosk", "wake-word", "hotkey", "automation"]
+keywords = ["voice", "kws", "wake-word", "llm", "hotkey", "automation"]
 dependencies = [
+    # 本地：麦克风采集 + 唤醒词检测
     "sounddevice>=0.4.6",
     "numpy>=1.24",
-    "vosk>=0.3.44",
+    "sherpa-onnx>=1.10.0",
+    # sherpa-onnx 的原生库（含 onnxruntime）在这个包里面，必须和 sherpa-onnx 版本一致。
+    # 它的元数据是 Dynamic，uv 解析时会漏掉，所以这里显式声明。
+    "sherpa-onnx-core==1.13.8",
+    "pypinyin>=0.51",
+    # 配置（按键发送在 Windows 上用自带的 SendInput 实现，不需要额外依赖）
     "tomlkit>=0.12.3",
-    "pynput>=1.7.6",
 ]
 
 [project.optional-dependencies]
-# 更准的识别引擎（可选）：uv sync --extra whisper
-whisper = ["faster-whisper>=1.0.3"]
+# 只有非 Windows 平台才需要它来兜底发按键
+pynput = ["pynput>=1.7.6"]
 
 [project.scripts]
 vc = "voice_control.cli:main"
@@ -34,10 +39,6 @@ packages = ["src/voice_control"]
 
 [dependency-groups]
 dev = ["pytest>=8.0"]
-
-[tool.uv]
-# vosk 依赖的 srt（仅用于 vosk 的字幕命令行工具）在 PyPI 上只有源码包，
-# 安装时 setuptools 会在本地构建它。这是正常的，uv sync 会自动处理。
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

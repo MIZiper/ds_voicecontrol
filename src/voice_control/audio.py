@@ -57,6 +57,43 @@ def peak_of(frame: bytes) -> float:
     return float(np.max(np.abs(data.astype(np.float32))) / 32768.0)
 
 
+def effective_threshold(threshold: float, floor: float, factor: float, adaptive: bool = True) -> float:
+    """实际静音门限 = max(校准值, 实时底噪 × 倍数)。"""
+    if not adaptive:
+        return float(threshold)
+    return float(max(float(threshold), float(floor) * max(0.0, float(factor))))
+
+
+@dataclass
+class LevelGate:
+    """只看「现在是不是有人在说话」：静音门限 + 底噪自适应。
+
+    ``Segmenter`` 内部也用同一套公式；唤醒后等待口令开始时用它来判断“开始说了”。
+    """
+
+    threshold: float = 0.010
+    threshold_factor: float = 2.5
+    adaptive: bool = True
+    alpha: float = 0.02
+    floor: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.floor is None:
+            self.floor = float(self.threshold) / max(1.0, float(self.threshold_factor))
+
+    @property
+    def effective(self) -> float:
+        return effective_threshold(self.threshold, self.floor or 0.0, self.threshold_factor, self.adaptive)
+
+    def push(self, level: float) -> bool:
+        """喂一个音量值，返回是否超过门限（说话中）。"""
+        if level >= self.effective:
+            return True
+        if self.adaptive:
+            self.floor = (1 - self.alpha) * float(self.floor or 0.0) + self.alpha * level
+        return False
+
+
 # --------------------------------------------------------------------------- #
 # 设备
 # --------------------------------------------------------------------------- #
@@ -346,10 +383,9 @@ class Segmenter:
 
     @property
     def effective_threshold(self) -> float:
-        if self.adaptive_noise:
-            adaptive = self._floor * self.threshold_factor
-            return float(max(self.threshold, adaptive))
-        return float(self.threshold)
+        return effective_threshold(
+            self.threshold, self._floor, self.threshold_factor, self.adaptive_noise
+        )
 
     @property
     def noise_floor(self) -> float:

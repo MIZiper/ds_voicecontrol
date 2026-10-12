@@ -1,35 +1,51 @@
 """命令行入口：``vc <子命令>``。
 
+工作方式：本地只做「判断有没有说话」+「听唤醒词」，命令理解交给大模型，动作在本地执行。
+
 子命令一览：
 
 * ``vc init``        生成带注释的默认配置
 * ``vc devices``     列出可用麦克风
 * ``vc meter``       实时电平表（看麦克风有没有声音、门限合不合适）
 * ``vc calibrate``   监听一小段，测环境底噪并写入静音门限
-* ``vc setup``       下载离线识别模型
-* ``vc rules``       查看当前配置里的口令规则
-* ``vc say 文本``    不走麦克风，直接把文本喂给口令匹配（调试规则）
+* ``vc setup``       下载本地唤醒词模型
+* ``vc wake``        只测本地唤醒词（不联网、不调用大模型）
+* ``vc rules``       查看允许执行的命令表
+* ``vc keytest``     按键自测（排查“日志成功但程序没反应”）
+* ``vc doctor``      自检 + 真实调用一次大模型，排查“为什么没执行”
+* ``vc say 文本``    不走麦克风，直接把一句话交给大模型
 * ``vc run``         开始监听（主功能）
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
 
 from . import __version__, ui
-from .actions import ActionExecutor, known_key_names
+from .actions import (
+    ActionExecutor,
+    chain_looks_like_interactive_shell,
+    foreground_window,
+    integrity_via_whoami,
+    known_key_names,
+    process_integrity_level,
+    process_parent_chain,
+    window_integrity_level,
+    window_process_id,
+)
 from .audio import (
     AudioError,
     Microphone,
+    read_wav_mono,
     list_input_devices,
     measure_noise,
     rms_of,
 )
 from .config import (
-    ACTION_TYPES,
     Config,
     ConfigError,
     load_config,
@@ -38,12 +54,14 @@ from .config import (
     save_noise_threshold,
     write_default_config,
 )
+from .kws import KwsError, WakeWordSpotter, ensure_keywords_file
 from .listener import Listener
-from .models import ModelError, ensure_vosk_model, installed_vosk_models, vosk_model_info
+from .models import ModelError, ensure_model, installed_models, model_info
 
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_INTERRUPT = 130
+SELF_TEST_TITLE = "vc keytest（可以关掉我）"
 
 
 # --------------------------------------------------------------------------- #
@@ -70,8 +88,6 @@ def _load_for_run(args: argparse.Namespace) -> Config:
     config = load_config(path)
     if getattr(args, "device", None):
         config.audio.device = args.device
-    if getattr(args, "engine", None):
-        config.asr.engine = args.engine
     _print_warnings(config)
     problems = config.problems()
     if problems:
@@ -86,6 +102,25 @@ def _countdown(seconds: int) -> None:
     print("\r" + " " * 24 + "\r", end="", flush=True)
 
 
+def _prepare_spotter(config: Config, threshold: float | None = None) -> WakeWordSpotter:
+    wake = config.wake
+    model_dir = ensure_model(
+        config.models_dir, wake.model, auto_download=wake.auto_download, log=ui.plain
+    )
+    keywords_file = ensure_keywords_file(
+        model_dir, wake.words, wake.keywords_file or None, log=ui.info
+    )
+    return WakeWordSpotter(
+        model_dir,
+        keywords_file,
+        threshold=wake.threshold if threshold is None else threshold,
+        score=wake.score,
+        num_threads=wake.num_threads,
+        sample_rate=config.audio.sample_rate,
+        log=ui.plain,
+    )
+
+
 # --------------------------------------------------------------------------- #
 # 子命令
 # --------------------------------------------------------------------------- #
@@ -98,9 +133,12 @@ def cmd_init(args: argparse.Namespace) -> int:
         return EXIT_ERROR
     ui.ok(f"已生成配置文件：{written}")
     ui.plain("接下来的推荐步骤：")
-    ui.plain("  1) uv run vc calibrate    # 监听 5 秒测环境底噪，写入静音门限")
-    ui.plain("  2) uv run vc setup        # 下载离线识别模型（首次需要联网，约 42MB）")
-    ui.plain("  3) uv run vc run          # 开始监听（先按 Ctrl+C 退出）")
+    ui.plain("  1) 设置大模型 API Key，例如： $env:DASHSCOPE_API_KEY = \"sk-...\"")
+    ui.plain("  2) uv run vc calibrate    # 监听 5 秒测环境底噪，写入静音门限")
+    ui.plain("  3) uv run vc setup        # 下载本地唤醒词模型（约 31MB）")
+    ui.plain("  4) uv run vc wake         # 只测唤醒词，确认能叫醒")
+    ui.plain("  5) uv run vc doctor       # 自检并真实调用一次大模型")
+    ui.plain("  6) uv run vc run          # 正式监听（Ctrl+C 退出）")
     return EXIT_OK
 
 
@@ -134,8 +172,7 @@ def cmd_meter(args: argparse.Namespace) -> int:
             deadline = time.monotonic() + args.seconds
             peak = 0.0
             while time.monotonic() < deadline:
-                frame = mic.read_frame()
-                level = rms_of(frame)
+                level = rms_of(mic.read_frame())
                 peak = max(peak, level)
                 print("\r  " + _level_bar(level, threshold), end="", flush=True)
             print()
@@ -158,8 +195,7 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
     config = load_config_or_defaults(path)
     seconds = float(args.seconds)
     ui.title("环境底噪校准")
-    ui.plain("  说明：请保持平时的环境（空调/风扇开着没关系），校准期间尽量不要说话，")
-    ui.plain(f"        接下来会连续采集 {seconds:.0f} 秒的环境噪音。")
+    ui.plain("  说明：请保持平时的环境（空调/风扇开着没关系），校准期间尽量不要说话。")
     if args.device:
         config.audio.device = args.device
     mic = Microphone(
@@ -189,13 +225,10 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
     suggested = stats.suggest_threshold()
     ui.ok(f"  建议静音门限 noise_threshold = {suggested:.5f}")
     ui.plain(
-        f"  （运行时实际门限 = max(noise_threshold, 实时底噪 × {config.audio.threshold_factor})，"
-        f"所以底噪变化也能自动适应）"
+        f"  （运行时实际门限 = max(noise_threshold, 实时底噪 × {config.audio.threshold_factor})）"
     )
     if stats.max_rms > stats.median * 15 and stats.max_rms > 0.03:
-        ui.warn("校准期间检测到明显的声音（可能是说话/敲键盘/关门），建议安静时重测一次")
-    if stats.median < 0.0005:
-        ui.plain("  底噪很低，这是好事。")
+        ui.warn("校准期间检测到明显的声音，建议安静时重测一次")
     if not args.no_write:
         try:
             save_noise_threshold(suggested, path)
@@ -212,33 +245,230 @@ def cmd_setup(args: argparse.Namespace) -> int:
     config = load_config_or_defaults(args.config)
     models_dir = config.models_dir
     ui.info(f"模型目录：{models_dir}")
-    installed = installed_vosk_models(models_dir)
+    installed = installed_models(models_dir)
     if installed:
-        ui.plain("  已安装的模型：")
+        ui.plain("  已安装的唤醒词模型：")
         for path in installed:
             ui.plain(f"    - {path.name}")
-    engine = args.engine or config.asr.engine
-    if engine == "vosk":
-        name = args.model or config.asr.vosk_model
-        info = vosk_model_info(name)
-        ui.plain(f"  目标模型：{name} —— {info.description}")
+    name = args.model or config.wake.model
+    info = model_info(name)
+    ui.plain(f"  目标模型：{name} —— {info.description}")
+    try:
+        path = ensure_model(models_dir, name, auto_download=True, log=ui.plain)
+    except ModelError as exc:
+        ui.error(str(exc))
+        return EXIT_ERROR
+    ui.ok(f"唤醒词模型就绪：{path}")
+    try:
+        keywords_file = ensure_keywords_file(
+            path, config.wake.words, config.wake.keywords_file or None, log=ui.info
+        )
+        ui.plain(f"  唤醒词文件：{keywords_file}")
+        for line in keywords_file.read_text(encoding="utf-8").splitlines():
+            ui.plain(f"    {line}")
+    except KwsError as exc:
+        ui.error(str(exc))
+        return EXIT_ERROR
+    ui.plain("  下一步：`uv run vc wake` 测一下唤醒词，`uv run vc doctor` 自检大模型。")
+    return EXIT_OK
+
+
+def cmd_wake(args: argparse.Namespace) -> int:
+    config = load_config_or_defaults(args.config)
+    _print_warnings(config)
+    if not config.wake.enabled:
+        ui.warn("配置里 wake.enabled = false（不需要唤醒词），无需测试唤醒。")
+    try:
+        spotter = _prepare_spotter(config, threshold=args.threshold)
+    except (ModelError, KwsError) as exc:
+        ui.error(str(exc))
+        return EXIT_ERROR
+    ui.info(f"唤醒词：{'、'.join(spotter.keywords) or '（未知）'}")
+    if args.wav:
         try:
-            path = ensure_vosk_model(models_dir, name, auto_download=True, log=ui.plain)
-        except ModelError as exc:
+            pcm = read_wav_mono(args.wav, target_rate=config.audio.sample_rate)
+        except AudioError as exc:
             ui.error(str(exc))
             return EXIT_ERROR
-        ui.ok(f"Vosk 模型就绪：{path}")
+        frame_bytes = int(config.audio.sample_rate * config.audio.frame_ms / 1000) * 2
+        hits = []
+        for offset in range(0, len(pcm) - frame_bytes + 1, frame_bytes):
+            hit = spotter.feed_frame(pcm[offset : offset + frame_bytes])
+            if hit is not None:
+                hits.append(hit.keyword)
+        if hits:
+            ui.ok(f"命中唤醒词：{'、'.join(hits)}")
+            return EXIT_OK
+        ui.warn("没有检测到唤醒词。可以调低 wake.threshold（例如 0.15）再试。")
+        return EXIT_ERROR
+
+    mic = Microphone(
+        sample_rate=config.audio.sample_rate,
+        frame_ms=config.audio.frame_ms,
+        device=args.device or config.audio.device,
+    )
+    ui.info(f"只测唤醒词，不联网（{args.seconds:.0f} 秒）。喊一句唤醒词看看有没有反应。")
+    hits = 0
+    last_hit = 0.0
+    try:
+        with mic:
+            ui.plain(f"  输入设备 : {mic.describe()}")
+            deadline = time.monotonic() + args.seconds
+            while time.monotonic() < deadline:
+                frame = mic.read_frame()
+                hit = spotter.feed_frame(frame)
+                now = time.monotonic()
+                if hit is not None and now - last_hit > 1.0:
+                    last_hit = now
+                    hits += 1
+                    ui.ok(f"  第 {hits} 次命中：{hit.keyword}")
+    except AudioError as exc:
+        ui.error(str(exc))
+        return EXIT_ERROR
+    except KeyboardInterrupt:
+        print()
+    if hits:
+        ui.ok(f"共命中 {hits} 次。")
         return EXIT_OK
-    if engine == "whisper":
-        ui.plain(
-            "  faster-whisper 的模型由 HuggingFace 缓存在上面这个目录，"
-            "第一次运行 `vc run` 时会自动下载。"
-        )
-        ui.plain("  如果下载慢，可以在配置里设置 asr.hf_endpoint = \"https://hf-mirror.com\"。")
-        ui.plain("  另外记得装可选依赖：uv sync --extra whisper")
-        return EXIT_OK
-    ui.error(f"未知引擎：{engine}")
+    ui.warn(
+        "一次都没命中。排查顺序：① `vc meter` 确认麦克风有电平；② 说的是配置里的唤醒词；"
+        "③ 调低 wake.threshold（0.25 -> 0.15）；④ 换更常见的唤醒词。"
+    )
     return EXIT_ERROR
+
+
+def _make_executor(config: Config, *, dry_run: bool = False) -> ActionExecutor:
+    """按配置创建动作执行器。"""
+    return ActionExecutor(
+        allow=tuple(config.commands.allow),
+        allow_shell=config.commands.allow_shell,
+        dry_run=dry_run,
+    )
+
+
+def _self_window_key_test() -> tuple[str, str]:
+    """在自己创建的窗口里发一段文字和一次组合键并读回，验证按键链路。"""
+    try:
+        import tkinter as tk
+    except Exception as exc:  # pragma: no cover
+        return "skip", f"没有 tkinter，跳过自测：{exc}"
+    try:
+        root = tk.Tk()
+    except Exception as exc:  # pragma: no cover
+        return "skip", f"无法创建测试窗口（可能没有桌面会话）：{exc}"
+    marker = "vc-keytest-中英ABC123"
+    our_pid = os.getpid()
+    try:
+        root.title(SELF_TEST_TITLE)
+        root.geometry("460x140+120+120")
+        widget = tk.Text(root, width=44, height=4)
+        widget.pack()
+        root.attributes("-topmost", True)
+        root.lift()
+        root.focus_force()
+        widget.focus_set()
+        deadline = time.monotonic() + 0.8
+        while time.monotonic() < deadline:
+            root.update()
+            time.sleep(0.02)
+
+        hwnd, title = foreground_window()
+        if window_process_id(hwnd) != our_pid:
+            return (
+                "skip",
+                f"测试窗口没能拿到前台焦点（当前前台是 {title!r}），"
+                "为了不把文字打进你正在用的窗口，已跳过按键自测",
+            )
+
+        executor = ActionExecutor(allow=("text", "hotkey"), dry_run=False)
+        text_result = executor.execute({"type": "text", "text": marker})[0]
+        hotkey_result = executor.execute({"type": "hotkey", "keys": ["ctrl", "a"]})[0]
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            root.update()
+            time.sleep(0.02)
+        content = widget.get("1.0", "end-1c")
+        selected = widget.get("sel.first", "sel.last") if widget.tag_ranges("sel") else ""
+        if content == marker and selected.strip() == marker:
+            return "ok", f"文字与组合键都生效：{text_result.detail}；{hotkey_result.detail}"
+        return (
+            "fail",
+            f"窗口读到 {content!r} / 选中 {selected!r}；"
+            f"动作结果：{text_result.detail}；{hotkey_result.detail}",
+        )
+    finally:
+        try:
+            root.destroy()
+        except Exception:  # pragma: no cover
+            pass
+
+
+def cmd_keytest(args: argparse.Namespace) -> int:
+    ui.title("按键自测（判断“为什么日志显示成功但没反应”）")
+    level = process_integrity_level()
+    independent = integrity_via_whoami()
+    ui.plain(f"  进程完整性级别：{level}（用系统 whoami 独立校验：{independent}）")
+    if independent != "Unknown" and level != "Unknown" and independent != level:
+        ui.warn(
+            f"两次读取结果不一致（{level} vs {independent}），请把这段输出发给我，"
+            "并以此为准：whoami 是系统自己给的。"
+        )
+    if level == "Low" or independent == "Low":
+        ui.warn(
+            "低完整性 = 这个进程被以受限方式启动的（长得像普通 PowerShell 也一样），"
+            "Windows 的 UIPI 会静默拦掉模拟按键：日志显示 [OK]，但目标程序一个键都收不到。"
+        )
+        chain = process_parent_chain()
+        if chain:
+            ui.plain("  启动链（每一层都标了它自己的完整性级别）：")
+            ui.plain("    " + "  ←  ".join(chain))
+            first_medium = next(
+                (link for link in chain if "[Medium]" in link or "[High]" in link), ""
+            )
+            if first_medium:
+                ui.plain(
+                    f"    ↑ 链上有 Medium 的进程（例如 {first_medium.split('[')[0]}），"
+                    "而当前是 Low → 是它（或它中间的一层）把权限降下来后启动了这条命令。"
+                )
+            elif not chain_looks_like_interactive_shell(chain):
+                ui.plain(
+                    "    ↑ 链里没有 explorer / 终端宿主：说明这条命令是被某个启动器"
+                    "（助手、IDE 任务、终端面板…）拉起的，不是你在交互式终端里敲的。"
+                )
+        ui.plain(
+            "  自证方法：在同一个终端里执行  whoami /groups | findstr /i Mandatory\n"
+            "            Medium = 正常终端；Low = 这个终端被限制过，按键会被系统丢掉。"
+        )
+        ui.plain(
+            "  解决办法：开一个“干净”的终端再跑——按 Win+R 输入 wt（或从开始菜单打开 "
+            "Windows Terminal / PowerShell），cd 到项目目录后执行 uv run vc run。"
+        )
+
+    hwnd, title = foreground_window()
+    ui.plain(f"  当前前台窗口：{title!r}（所属进程完整性：{window_integrity_level(hwnd)}）")
+    ui.plain("  说明：按键只会发给当前前台窗口；目标程序以管理员身份运行时，普通权限发不进去。")
+
+    status, detail = _self_window_key_test()
+    if status == "ok":
+        ui.ok(f"  自测通过：{detail}")
+    elif status == "skip":
+        ui.warn(f"  自测跳过：{detail}")
+    else:
+        ui.error(f"  自测失败：{detail}")
+
+    if args.cross_app:
+        ui.plain("")
+        ui.warn("6 秒后会向【当前前台窗口】输入一段测试文字，请先切到记事本并把光标放到输入区。")
+        _countdown(6)
+        marker = "vc-keytest-ok"
+        executor = ActionExecutor(allow=("text", "hotkey"), dry_run=False)
+        results = executor.execute({"type": "text", "text": marker})
+        ui.plain(f"  已发送 {marker!r}：{results[0]}")
+        ui.plain("  如果目标窗口里没出现这段文字，说明按键被系统拦了：")
+        ui.plain("    · 进程在沙箱里（完整性 Low）→ 换普通终端")
+        ui.plain("    · 目标程序以管理员身份运行 → 让 vc run 也以管理员运行")
+        ui.plain("    · 或者发给了别的前台窗口 → 用 focus 动作先切窗口")
+    return EXIT_OK if status != "fail" else EXIT_ERROR
 
 
 def cmd_rules(args: argparse.Namespace) -> int:
@@ -249,14 +479,18 @@ def cmd_rules(args: argparse.Namespace) -> int:
     _print_warnings(config)
     rules = config.rules if args.all else config.enabled_rules()
     if not rules:
-        ui.warn("没有配置任何口令规则，编辑 config.toml 的 [[rules]] 添加。")
+        ui.warn("没有配置任何命令，编辑 config.toml 的 [[rules]] 添加。")
         return EXIT_OK
-    ui.title(f"当前口令规则（{len(rules)} 条，匹配阈值 {config.commands.match_threshold}）：")
+    ui.title(f"允许执行的命令（{len(rules)} 条）：大模型只能从这里挑")
     for rule in rules:
         flag = "" if rule.enabled else "（已停用）"
-        ui.plain(f"  「{rule.name}」{flag}")
-        ui.plain(f"      触发词：{'、'.join(rule.phrases)}")
-        ui.plain(f"      动作　：{rule.summary()}")
+        ui.plain(f"  [{rule.id}] {rule.name}{flag}")
+        if rule.description:
+            ui.plain(f"      说明：{rule.description}")
+        ui.plain(f"      示例：{'、'.join(rule.phrases)}")
+        if rule.slots:
+            ui.plain(f"      槽位：{', '.join(rule.slots)}")
+        ui.plain(f"      动作：{rule.summary()}")
     ui.plain("")
     ui.plain(f"  允许的动作类型：{', '.join(config.commands.allow)}")
     if not config.commands.allow_shell:
@@ -265,22 +499,104 @@ def cmd_rules(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_doctor(args: argparse.Namespace) -> int:
+    ui.title("ds_voicecontrol 自检")
+    ok_all = True
+
+    path = resolve_config_path(args.config)
+    if not path.exists():
+        ui.error(f"[!!] 找不到配置文件：{path}（先运行 `vc init`）")
+        return EXIT_ERROR
+    config = load_config(path)
+    ui.plain(f"[ok] 配置文件：{path}")
+    _print_warnings(config)
+
+    problems = config.problems()
+    for problem in problems:
+        ui.error(f"[!!] {problem}")
+        ok_all = False
+    if not problems:
+        ui.plain("[ok] 配置项检查通过")
+
+    key = config.resolve_api_key()
+    env_name = config.llm.api_key_env or "DASHSCOPE_API_KEY"
+    if key:
+        masked = key[:6] + "…" + key[-4:] if len(key) > 12 else "***"
+        source = "配置 llm.api_key" if config.llm.api_key.strip() else f"环境变量 {env_name}"
+        ui.plain(f"[ok] API Key 已设置（{source}）：{masked}")
+    else:
+        ui.error(f"[!!] 没有找到 API Key：设置环境变量 {env_name}，或填 llm.api_key")
+        ok_all = False
+
+    level = process_integrity_level()
+    independent = integrity_via_whoami()
+    hwnd, title = foreground_window()
+    if level == "Low" or independent == "Low":
+        ui.error(
+            "[!!] 进程完整性级别是 Low：这个终端被以受限方式启动，模拟按键会被 Windows 静默拦掉"
+            "（日志会显示 [OK] 但程序没反应）。请用 `uv run vc keytest` 看启动链，"
+            "并改在干净终端（Win+R → wt）里运行 `vc run`。"
+        )
+        chain = process_parent_chain()
+        if chain:
+            ui.plain("      启动链：" + "  ←  ".join(chain))
+        ui.plain(f"      当前前台窗口：{title!r}（完整性 {window_integrity_level(hwnd)}）")
+        ok_all = False
+    else:
+        ui.plain(
+            f"[ok] 进程完整性级别：{level}（whoami 独立校验：{independent}），模拟按键可以发给普通程序"
+        )
+        ui.plain(f"     当前前台窗口：{title!r}（完整性 {window_integrity_level(hwnd)}）")
+
+    try:
+        model_dir = ensure_model(
+            config.models_dir,
+            config.wake.model,
+            auto_download=False,
+            log=ui.plain,
+        )
+        ui.plain(f"[ok] 唤醒词模型：{model_dir}")
+        keywords_file = ensure_keywords_file(
+            model_dir, config.wake.words, config.wake.keywords_file or None, log=None
+        )
+        ui.plain(f"[ok] 唤醒词文件：{keywords_file}")
+        for line in keywords_file.read_text(encoding="utf-8").splitlines():
+            ui.plain(f"       {line}")
+    except (ModelError, KwsError) as exc:
+        ui.error(f"[!!] 唤醒词模型不可用：{exc}")
+        ui.plain("     运行 `uv run vc setup` 下载模型。")
+        ok_all = False
+
+    ui.plain(f"[..] 正在真实调用一次大模型（{config.llm.model}）……")
+    listener = Listener(
+        config,
+        spotter=object(),  # 只测大模型，不加载唤醒词模型
+        executor=_make_executor(config, dry_run=True),
+    )
+    status = listener.handle_text(args.text)
+    if status == "llm-error":
+        ui.error("[!!] 大模型调用失败，具体原因见上面的错误信息")
+        ok_all = False
+    else:
+        ui.ok(f"[ok] 大模型调用成功（结果：{status}）")
+    ui.plain("")
+    if ok_all:
+        ui.ok("自检通过，可以 `uv run vc run` 开始监听了。")
+        return EXIT_OK
+    ui.warn("自检发现问题，请按上面的提示逐条处理。")
+    return EXIT_ERROR
+
+
 def cmd_say(args: argparse.Namespace) -> int:
     config = load_config_or_defaults(args.config)
     _print_warnings(config)
-    executor = ActionExecutor(
-        allow=tuple(config.commands.allow),
-        allow_shell=config.commands.allow_shell,
-        dry_run=args.dry_run,
-    )
-    listener = Listener(config, executor=executor)
-    if args.no_wake:
-        listener.require_wake = False
+    executor = _make_executor(config, dry_run=args.dry_run)
+    listener = Listener(config, spotter=object(), executor=executor)
     if args.dry_run:
         ui.info("演练模式：只显示会执行什么，不会真的按键/打开程序。")
     status = listener.handle_text(args.text)
     ui.plain(f"  结果：{status}")
-    return EXIT_OK if not status.startswith("failed") else EXIT_ERROR
+    return EXIT_OK if not status.startswith(("failed", "llm-error")) else EXIT_ERROR
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -289,24 +605,24 @@ def cmd_run(args: argparse.Namespace) -> int:
     except ConfigError as exc:
         ui.error(str(exc))
         return EXIT_ERROR
-    executor = ActionExecutor(
-        allow=tuple(config.commands.allow),
-        allow_shell=config.commands.allow_shell,
-        dry_run=args.dry_run,
-    )
+    executor = _make_executor(config, dry_run=args.dry_run)
     listener = Listener(config, executor=executor)
     if args.no_wake:
-        listener.require_wake = False
+        listener.wake_enabled = False
+        listener.state = "capturing"
     if args.dry_run:
         ui.info("演练模式：识别和匹配照常，但不会真的执行动作。")
-    if args.wav:
-        return listener.run(wav=Path(args.wav))
     try:
+        if args.wav:
+            return listener.run(wav=Path(args.wav))
         return listener.run(once=args.once, duration=args.duration)
     except AudioError as exc:
         ui.error(str(exc))
         return EXIT_ERROR
     except ModelError as exc:
+        ui.error(str(exc))
+        return EXIT_ERROR
+    except KwsError as exc:
         ui.error(str(exc))
         return EXIT_ERROR
     except KeyboardInterrupt:
@@ -326,13 +642,14 @@ def cmd_version(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="vc",
-        description="本地语音控制：唤醒词 -> 离线识别 -> 口令 -> 系统快捷键/操作",
+        description="本地语音控制：本地听唤醒词，语音交给大模型选命令，本地执行按键/操作",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "常用流程：\n"
             "  uv run vc init        生成 config.toml\n"
             "  uv run vc calibrate   测环境底噪\n"
-            "  uv run vc setup       下载识别模型\n"
+            "  uv run vc setup       下载唤醒词模型\n"
+            "  uv run vc doctor      自检（含真实调用一次大模型）\n"
             "  uv run vc run         开始监听\n"
         ),
     )
@@ -364,29 +681,45 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_argument("--no-write", action="store_true", help="只显示结果，不修改配置文件")
     sub.set_defaults(func=cmd_calibrate)
 
-    sub = add_common(subparsers.add_parser("setup", help="下载离线识别模型"))
-    sub.add_argument("--engine", choices=["vosk", "whisper"], help="要准备的引擎")
-    sub.add_argument("--model", help="Vosk 模型名，例如 vosk-model-small-cn-0.22")
+    sub = add_common(subparsers.add_parser("setup", help="下载本地唤醒词模型"))
+    sub.add_argument("--model", help="模型名，例如 sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01")
     sub.set_defaults(func=cmd_setup)
 
-    sub = add_common(subparsers.add_parser("rules", help="查看口令规则"))
-    sub.add_argument("--all", action="store_true", help="包括已停用的规则")
+    sub = add_common(subparsers.add_parser("wake", help="只测本地唤醒词（不联网）"))
+    sub.add_argument("--seconds", type=float, default=20.0, help="测试时长（秒），默认 20")
+    sub.add_argument("--threshold", type=float, help="临时指定命中阈值（默认用配置值 0.25）")
+    sub.add_argument("--device", help="临时指定输入设备（编号或名称片段）")
+    sub.add_argument("--wav", help="不接麦克风，直接测一个 wav 文件")
+    sub.set_defaults(func=cmd_wake)
+
+    sub = add_common(subparsers.add_parser("rules", help="查看允许执行的命令表"))
+    sub.add_argument("--all", action="store_true", help="包括已停用的命令")
     sub.set_defaults(func=cmd_rules)
 
-    sub = add_common(subparsers.add_parser("say", help="不走麦克风，直接测试一句话会触发什么"))
-    sub.add_argument("text", help="要测试的文本，例如 \"小助手 复制\"")
+    sub = add_common(subparsers.add_parser("keytest", help="按键自测（排查“成功但没反应”）"))
+    sub.add_argument(
+        "--cross-app",
+        action="store_true",
+        help="额外做一次跨程序测试：倒计时后向当前前台窗口输入一段文字（需你手动聚焦目标窗口）",
+    )
+    sub.set_defaults(func=cmd_keytest)
+
+    sub = add_common(subparsers.add_parser("doctor", help="自检 + 真实调用一次大模型"))
+    sub.add_argument("--text", default="复制一下", help="用这句话测试大模型，默认“复制一下”")
+    sub.set_defaults(func=cmd_doctor)
+
+    sub = add_common(subparsers.add_parser("say", help="不走麦克风，直接把一句话交给大模型"))
+    sub.add_argument("text", help="要测试的话，例如 \"把音量调小一点\"")
     sub.add_argument("--dry-run", action="store_true", help="只显示，不真正执行")
-    sub.add_argument("--no-wake", action="store_true", help="跳过唤醒词，直接按口令处理")
     sub.set_defaults(func=cmd_say)
 
     sub = add_common(subparsers.add_parser("run", help="开始监听（主功能）"))
-    sub.add_argument("--once", action="store_true", help="只处理一段语音就退出")
+    sub.add_argument("--once", action="store_true", help="处理一条命令就退出")
     sub.add_argument("--duration", type=float, help="监听指定秒数后自动退出（便于自动化测试）")
     sub.add_argument("--dry-run", action="store_true", help="识别匹配照常，但不真正执行动作")
     sub.add_argument("--no-wake", action="store_true", help="本次运行不需要唤醒词")
     sub.add_argument("--wav", help="不接麦克风，直接处理一个 wav 文件（用于离线测试）")
     sub.add_argument("--device", help="临时指定输入设备（编号或名称片段）")
-    sub.add_argument("--engine", choices=["vosk", "whisper"], help="临时切换识别引擎")
     sub.set_defaults(func=cmd_run)
 
     sub = add_common(subparsers.add_parser("version", help="显示版本"))

@@ -1,8 +1,12 @@
 """配置读取/写入（TOML），以及配置项校验。
 
-配置文件默认是项目根目录下的 `config.toml`，可以用 `--config 路径` 或环境变量
-`VC_CONFIG` 指定别的文件。读取时对未知字段、类型错误都会给出警告但不会崩溃，
-方便用户边改边试。
+架构：本地只负责「判断有没有说话」和「听唤醒词」，命令理解交给大模型。
+因此配置分成几块：
+
+* ``[audio]``  麦克风与静音门限（`vc calibrate` 自动写入）
+* ``[wake]``   本地唤醒词（sherpa-onnx 关键词检测）
+* ``[llm]``    大模型（OpenAI 兼容接口，默认阿里云百炼 / qwen-audio）
+* ``[[rules]]`` 允许执行的命令表：模型只能从这里面挑
 """
 
 from __future__ import annotations
@@ -18,7 +22,7 @@ from .config_default import DEFAULT_CONFIG_TOML
 DEFAULT_CONFIG_NAME = "config.toml"
 ENV_CONFIG_PATH = "VC_CONFIG"
 
-ACTION_TYPES = ("hotkey", "press", "text", "app", "wait", "sequence", "shell")
+ACTION_TYPES = ("hotkey", "press", "text", "app", "focus", "wait", "sequence", "shell")
 ACTION_FIELDS = (
     "type",
     "keys",
@@ -26,15 +30,19 @@ ACTION_FIELDS = (
     "interval_ms",
     "text",
     "target",
+    "title",
     "command",
     "cwd",
     "ms",
     "steps",
     "shell",
 )
-ENGINES = ("vosk", "whisper")
 UNKNOWN_MODES = ("log", "ignore", "beep")
 LOG_LEVELS = ("debug", "info", "warning", "error")
+DEFAULT_KWS_MODEL = "sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01"
+DEFAULT_LLM_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+DEFAULT_LLM_MODEL = "qwen-audio-turbo-latest"
+DEFAULT_API_KEY_ENV = "DASHSCOPE_API_KEY"
 
 
 class ConfigError(RuntimeError):
@@ -65,35 +73,49 @@ class AudioConfig:
 
 
 @dataclass
-class AsrConfig:
-    engine: str = "vosk"
+class WakeConfig:
+    """本地唤醒词：sherpa-onnx 关键词检测（不上云、不识别整句话）。"""
+
+    enabled: bool = True
+    words: list[str] = field(default_factory=lambda: ["小助手", "你好小助手"])
     models_dir: str = "models"
-    vosk_model: str = "vosk-model-small-cn-0.22"
-    whisper_model: str = "small"
-    whisper_device: str = "cpu"
-    whisper_compute_type: str = "int8"
-    hf_endpoint: str = ""
+    model: str = DEFAULT_KWS_MODEL
+    keywords_file: str = ""
+    threshold: float = 0.25
+    score: float = 1.0
+    num_threads: int = 2
+    wait_ms: int = 5000
+    command_max_ms: int = 8000
     auto_download: bool = True
 
 
 @dataclass
-class WakeConfig:
+class LlmConfig:
+    """命令理解用的大模型（OpenAI 兼容的 chat/completions + input_audio）。"""
+
     enabled: bool = True
-    require_wake: bool = True
-    words: list[str] = field(default_factory=lambda: ["小助手", "你好小助手"])
-    fuzzy: float = 0.82
-    window_s: float = 5.0
+    base_url: str = DEFAULT_LLM_BASE_URL
+    model: str = DEFAULT_LLM_MODEL
+    api_key: str = ""
+    api_key_env: str = DEFAULT_API_KEY_ENV
+    timeout_s: float = 30.0
+    temperature: float = 0.0
+    response_format_json: bool = True
+    audio_format: str = "wav"
+    extra_prompt: str = ""
+    save_audio_dir: str = ""
 
 
 @dataclass
 class CommandConfig:
     allow: list[str] = field(
-        default_factory=lambda: ["hotkey", "press", "text", "app", "wait", "sequence"]
+        default_factory=lambda: ["hotkey", "press", "text", "app", "focus", "wait", "sequence"]
     )
     allow_shell: bool = False
     unknown: str = "log"
-    match_threshold: float = 0.75
     cooldown_ms: int = 400
+    match_threshold: float = 0.75
+    fallback_local: bool = True
 
 
 @dataclass
@@ -102,14 +124,23 @@ class FeedbackConfig:
 
 
 # --------------------------------------------------------------------------- #
-# 规则
+# 命令表（规则）
 # --------------------------------------------------------------------------- #
 @dataclass
 class Rule:
+    """一条允许执行的命令：模型返回的 ``id`` 必须能在命令表里找到。"""
+
     name: str
     phrases: list[str]
     action: dict[str, Any]
     enabled: bool = True
+    id: str = ""
+    description: str = ""
+    slots: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not self.id:
+            self.id = self.name
 
     @property
     def type(self) -> str:
@@ -130,6 +161,8 @@ class Rule:
             detail = repr(action.get("text", ""))
         elif kind == "app":
             detail = str(action.get("target", ""))
+        elif kind == "focus":
+            detail = f"激活窗口 {action.get('title', '')!r}"
         elif kind == "wait":
             detail = f"{action.get('ms', 0)} ms"
         elif kind == "shell":
@@ -158,6 +191,9 @@ class Rule:
         elif kind == "app":
             if not str(self.action.get("target", "")).strip():
                 issues.append("缺少 target")
+        elif kind == "focus":
+            if not str(self.action.get("title", "")).strip():
+                issues.append("缺少 title")
         elif kind == "shell":
             if not str(self.action.get("command", "")).strip():
                 issues.append("缺少 command")
@@ -189,8 +225,8 @@ class Config:
     path: Path | None = None
     general: GeneralConfig = field(default_factory=GeneralConfig)
     audio: AudioConfig = field(default_factory=AudioConfig)
-    asr: AsrConfig = field(default_factory=AsrConfig)
     wake: WakeConfig = field(default_factory=WakeConfig)
+    llm: LlmConfig = field(default_factory=LlmConfig)
     commands: CommandConfig = field(default_factory=CommandConfig)
     feedback: FeedbackConfig = field(default_factory=FeedbackConfig)
     rules: list[Rule] = field(default_factory=list)
@@ -203,30 +239,72 @@ class Config:
 
     @property
     def models_dir(self) -> Path:
-        raw = Path(self.asr.models_dir).expanduser()
+        raw = Path(self.wake.models_dir).expanduser()
         return raw if raw.is_absolute() else (self.base_dir / raw)
 
-    # -- 便捷方法 ---------------------------------------------------------- #
+    @property
+    def wake_model_dir(self) -> Path:
+        return self.models_dir / self.wake.model
+
+    def resolve_api_key(self) -> str:
+        """优先用配置里的 api_key，其次读环境变量。"""
+        if self.llm.api_key.strip():
+            return self.llm.api_key.strip()
+        env_name = self.llm.api_key_env.strip()
+        if env_name:
+            return os.environ.get(env_name, "").strip()
+        return ""
+
+    # -- 命令表 ------------------------------------------------------------ #
+    def enabled_rules(self) -> list[Rule]:
+        return [rule for rule in self.rules if rule.enabled]
+
+    def rule_by_id(self, command_id: str) -> Rule | None:
+        wanted = (command_id or "").strip()
+        if not wanted:
+            return None
+        for rule in self.rules:
+            if rule.id == wanted or rule.name == wanted:
+                return rule if rule.enabled else None
+        # 大小写/空格不敏感兜底
+        normalized = wanted.lower().replace(" ", "").replace("_", "")
+        for rule in self.rules:
+            key = rule.id.lower().replace(" ", "").replace("_", "")
+            if key == normalized and rule.enabled:
+                return rule
+        return None
+
+    # -- 校验 -------------------------------------------------------------- #
     def problems(self) -> list[str]:
         """检查配置里会影响使用的硬性错误。"""
         issues: list[str] = []
-        if self.asr.engine not in ENGINES:
-            issues.append(f"asr.engine 只能是 {' 或 '.join(ENGINES)}，当前是 “{self.asr.engine}”")
         if self.audio.sample_rate <= 0:
             issues.append("audio.sample_rate 必须大于 0")
         if self.audio.frame_ms <= 0:
             issues.append("audio.frame_ms 必须大于 0")
-        if not self.wake.words and self.wake.enabled:
-            issues.append("wake.words 是空的，要么填唤醒词，要么把 wake.enabled 设为 false")
+        if self.wake.enabled:
+            if not self.wake.words:
+                issues.append("wake.words 是空的；要么填唤醒词，要么把 wake.enabled 设为 false")
+            if not self.wake.model:
+                issues.append("wake.model 不能为空")
+        if self.llm.enabled:
+            if not self.llm.base_url.strip():
+                issues.append("llm.base_url 不能为空（例如 https://dashscope.aliyuncs.com/compatible-mode/v1）")
+            if not self.llm.model.strip():
+                issues.append("llm.model 不能为空（例如 qwen-audio-turbo-latest）")
+            if not self.resolve_api_key():
+                hint = self.llm.api_key_env or "DASHSCOPE_API_KEY"
+                issues.append(
+                    f"没有找到大模型 API Key：请设置环境变量 {hint}（或把 key 填到 llm.api_key）"
+                )
         unknown_types = [t for t in self.commands.allow if t not in ACTION_TYPES]
         if unknown_types:
             issues.append(f"commands.allow 里有未知动作类型：{', '.join(unknown_types)}")
         if self.commands.unknown not in UNKNOWN_MODES:
             issues.append(f"commands.unknown 只能是 {'/'.join(UNKNOWN_MODES)}")
+        if self.llm.enabled and not self.enabled_rules():
+            issues.append("没有任何可执行的命令（[[rules]] 全为空或被停用）")
         return issues
-
-    def enabled_rules(self) -> list[Rule]:
-        return [rule for rule in self.rules if rule.enabled]
 
 
 # --------------------------------------------------------------------------- #
@@ -288,11 +366,13 @@ def _parse_rules(raw: Any, warnings: list[str]) -> list[Rule]:
         warnings.append("[[rules]] 应该是规则数组，已忽略")
         return []
     rules: list[Rule] = []
+    seen_ids: dict[str, str] = {}
     for index, item in enumerate(raw):
         if not isinstance(item, dict):
             warnings.append(f"第 {index + 1} 条规则不是表，已跳过")
             continue
         name = str(item.get("name") or f"规则{index + 1}")
+        command_id = str(item.get("id") or name).strip()
         phrases = item.get("phrases", item.get("phrase", []))
         if isinstance(phrases, str):
             phrases = [phrases]
@@ -301,7 +381,7 @@ def _parse_rules(raw: Any, warnings: list[str]) -> list[Rule]:
             continue
         phrases = [str(p).strip() for p in phrases if str(p).strip()]
         if not phrases:
-            warnings.append(f"规则「{name}」没有 phrases，已跳过")
+            warnings.append(f"规则「{name}」没有 phrases（作为模型的示例说法），已跳过")
             continue
         if isinstance(item.get("action"), dict):
             action = dict(item["action"])
@@ -310,16 +390,29 @@ def _parse_rules(raw: Any, warnings: list[str]) -> list[Rule]:
         if not action:
             warnings.append(f"规则「{name}」没有动作字段（type/keys/...），已跳过")
             continue
+        slots = item.get("slots", [])
+        if isinstance(slots, str):
+            slots = [slots]
+        slots = [str(s).strip() for s in slots if str(s).strip()] if isinstance(slots, list) else []
         rule = Rule(
             name=name,
             phrases=phrases,
             action=action,
             enabled=bool(item.get("enabled", True)),
+            id=command_id,
+            description=str(item.get("description", "") or ""),
+            slots=slots,
         )
         issues = rule.problems()
         if issues:
             warnings.append(f"规则「{name}」有问题，已跳过：{'；'.join(issues)}")
             continue
+        if command_id in seen_ids:
+            warnings.append(
+                f"规则「{name}」的 id 和「{seen_ids[command_id]}」重复（{command_id}），已跳过"
+            )
+            continue
+        seen_ids[command_id] = name
         if not rule.enabled:
             warnings.append(f"规则「{name}」已停用（enabled = false）")
         rules.append(rule)
@@ -330,9 +423,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
     """读取配置文件。文件不存在时抛 ConfigError（提示运行 `vc init`）。"""
     config_path = resolve_config_path(path)
     if not config_path.exists():
-        raise ConfigError(
-            f"配置文件不存在：{config_path}\n先运行 `vc init` 生成默认配置。"
-        )
+        raise ConfigError(f"配置文件不存在：{config_path}\n先运行 `vc init` 生成默认配置。")
     try:
         data = tomllib.loads(config_path.read_text(encoding="utf-8"))
     except tomllib.TOMLDecodeError as exc:
@@ -342,11 +433,13 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
     cfg = Config(path=config_path, warnings=warnings)
     cfg.general = _fill(GeneralConfig, data.get("general"), warnings, "general.")
     cfg.audio = _fill(AudioConfig, data.get("audio"), warnings, "audio.")
-    cfg.asr = _fill(AsrConfig, data.get("asr"), warnings, "asr.")
     cfg.wake = _fill(WakeConfig, data.get("wake"), warnings, "wake.")
+    cfg.llm = _fill(LlmConfig, data.get("llm"), warnings, "llm.")
     cfg.commands = _fill(CommandConfig, data.get("commands"), warnings, "commands.")
     cfg.feedback = _fill(FeedbackConfig, data.get("feedback"), warnings, "feedback.")
     cfg.rules = _parse_rules(data.get("rules"), warnings)
+    if "asr" in data:
+        warnings.append("[asr] 段已不再使用（命令理解改由大模型完成），可以删掉")
     cfg.warnings = warnings
     return cfg
 

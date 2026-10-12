@@ -16,6 +16,7 @@ uvcache/
 config.toml
 models/
 
-# 临时测试产物
+# 调试产物
 .tmp-test/
+debug-audio/
 *.log
