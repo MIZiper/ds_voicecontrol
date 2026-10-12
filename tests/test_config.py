@@ -18,7 +18,7 @@ from voice_control.config import (
 def test_default_config_has_wake_llm_and_rules(tmp_path: Path) -> None:
     path = write_default_config(tmp_path / "config.toml")
     config = load_config(path)
-    assert config.wake.words == ["小助手", "你好小助手"]
+    assert config.wake.words == ["牛来"]
     assert config.wake.model.startswith("sherpa-onnx-kws")
     assert config.llm.base_url.startswith("https://dashscope.aliyuncs.com")
     assert config.llm.api_key_env == "DASHSCOPE_API_KEY"

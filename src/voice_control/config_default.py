@@ -46,7 +46,7 @@ adaptive_noise = true
 # 是否启用本地唤醒词。false = 不需要唤醒词，检测到有人说话就把音频交给大模型
 enabled = true
 # 唤醒词列表：中文即可，程序会自动生成关键词文件（需要 pypinyin）
-words = ["小助手", "你好小助手"]
+words = ["牛来"]
 # 唤醒词模型目录（相对本配置文件所在目录）
 models_dir = "models"
 model = "sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01"

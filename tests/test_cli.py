@@ -65,7 +65,7 @@ def test_say_reports_unknown_command(tmp_path: Path, mock_llm, capsys) -> None:
 
 
 # 最小可用模型：只为了验证 doctor 的“模型就绪”分支，不做真实推理
-FAKE_TOKENS = ["<blk>", "x", "iǎo", "zh", "ù", "sh", "ǒu", "n", "ǐ", "h", "ǎo"]
+FAKE_TOKENS = ["<blk>", "n", "iú", "l", "ái"]
 
 
 def _fake_wake_model(tmp_path: Path) -> Path:
@@ -91,7 +91,7 @@ def test_doctor_ok(tmp_path: Path, mock_llm, capsys, monkeypatch: pytest.MonkeyP
     out = capsys.readouterr().out
     assert "ds_voicecontrol 自检" in out
     assert "[ok] 唤醒词模型" in out
-    assert "@小助手" in out
+    assert "@牛来" in out
     assert "大模型调用成功" in out
 
 

@@ -59,19 +59,8 @@ def test_syllable_split() -> None:
 
 
 def test_word_to_tokens_for_default_wake_words() -> None:
-    assert word_to_tokens("小助手") == ["x", "iǎo", "zh", "ù", "sh", "ǒu"]
-    assert word_to_tokens("你好小助手") == [
-        "n",
-        "ǐ",
-        "h",
-        "ǎo",
-        "x",
-        "iǎo",
-        "zh",
-        "ù",
-        "sh",
-        "ǒu",
-    ]
+    assert word_to_tokens("牛来") == ["n", "iú", "l", "ái"]
+    assert word_to_tokens("你好牛来") == ["n", "ǐ", "h", "ǎo", "n", "iú", "l", "ái"]
 
 
 def test_word_to_tokens_rejects_non_chinese() -> None:

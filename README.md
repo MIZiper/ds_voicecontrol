@@ -5,7 +5,7 @@
 **动作在本地执行**：按键、输入中文、打开程序、激活窗口、组合动作。
 
 ```
-说：小助手 ……（蜂鸣）…… 打开记事本
+说：牛来 ……（蜂鸣）…… 打开记事本
     │                     │
     │ 本地 KWS 唤醒        │ 本地 VAD 判断说话起止，录下这一句
     ▼                     ▼
@@ -48,12 +48,12 @@ $env:DASHSCOPE_API_KEY = "sk-你的key"              # 2. 设置大模型 Key（
 uv run vc init                                   # 3. 生成 config.toml
 uv run vc calibrate                              # 4. 安静 5 秒，测环境底噪
 uv run vc setup                                  # 5. 下载中文唤醒词模型（约 31MB）
-uv run vc wake                                   # 6. 只测唤醒词：喊“小助手”看有没有反应
+uv run vc wake                                   # 6. 只测唤醒词：喊“牛来”看有没有反应
 uv run vc doctor                                 # 7. 自检 + 真实调用一次大模型
 uv run vc run                                    # 8. 开始监听，Ctrl+C 退出
 ```
 
-然后说：**“小助手”**（听到蜂鸣）**“打开记事本”** —— 记事本会被打开。
+然后说：**“牛来”**（听到蜂鸣）**“打开记事本”** —— 记事本会被打开。
 
 调试期建议加 `--dry-run`：识别和决策照常，只是不真的按键。
 
@@ -104,7 +104,7 @@ uv run vc run --no-wake                # 本次不需要唤醒词
 | 项 | 默认 | 说明 |
 | --- | --- | --- |
 | `enabled` | `true` | `false` = 不需要唤醒词，检测到说话就直接发给大模型 |
-| `words` | `["小助手","你好小助手"]` | 中文唤醒词，程序自动转成拼音 token 生成关键词文件 |
+| `words` | `["牛来"]` | 中文唤醒词，程序自动转成拼音 token 生成关键词文件 |
 | `model` | `sherpa-onnx-kws-...-wenetspeech-3.3M-2024-01-01` | 中文唤醒词模型 |
 | `models_dir` | `models` | 模型目录（相对配置文件所在目录） |
 | `keywords_file` | `""` | 留空 = 自动生成 `models/wake-keywords.txt` |
@@ -234,8 +234,8 @@ steps = [
 程序会把中文唤醒词自动转成模型要的「声母 + 韵母」token：
 
 ```text
-小助手     ->  x iǎo zh ù sh ǒu @小助手
-你好小助手  ->  n ǐ h ǎo x iǎo zh ù sh ǒu @你好小助手
+牛来       ->  n iú l ái @牛来
+你好牛来    ->  n ǐ h ǎo n iú l ái @你好牛来   （可选：加进 words 更不容易漏唤醒）
 ```
 
 改唤醒词只要改 `[wake] words`，下次运行会自动重建关键词文件。

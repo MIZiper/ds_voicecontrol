@@ -77,7 +77,7 @@ class WakeConfig:
     """本地唤醒词：sherpa-onnx 关键词检测（不上云、不识别整句话）。"""
 
     enabled: bool = True
-    words: list[str] = field(default_factory=lambda: ["小助手", "你好小助手"])
+    words: list[str] = field(default_factory=lambda: ["牛来"])
     models_dir: str = "models"
     model: str = DEFAULT_KWS_MODEL
     keywords_file: str = ""

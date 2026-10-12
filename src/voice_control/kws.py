@@ -5,7 +5,7 @@
 
 中文唤醒词会自动转成模型要的「声母 + 韵母」token 序列，例如::
 
-    小助手  ->  x iǎo zh ù sh ǒu  @小助手
+    牛来  ->  n iú l ái  @牛来
 
 转换用 pypinyin（带声调），生成的关键词文件会在唤醒词变化时自动重建。
 """
@@ -117,7 +117,7 @@ def keywords_content(model_dir: str | os.PathLike[str], words: Sequence[str]) ->
         if missing:
             raise KwsError(
                 f"唤醒词 “{word}” 转出来的拼音 {missing} 不在模型的 token 表里，"
-                "请换一个更常见的词（例如“小助手”“你好小助手”）。"
+                "请换一个更常见的词（例如“牛来”“你好牛来”）。"
             )
         lines.append(" ".join(tokens) + f" @{word}")
     if not lines:
