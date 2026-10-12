@@ -40,6 +40,7 @@ def test_default_config_has_web_and_site_rules(tmp_path: Path) -> None:
         "open_site",
         "page_back",
         "page_forward",
+        "refresh",
         "tab_next",
         "tab_prev",
         "web_play_pause",
@@ -55,6 +56,7 @@ def test_default_config_has_web_and_site_rules(tmp_path: Path) -> None:
     assert config.rule_by_id("open_site").action == {"type": "url", "target": "{url}"}
     assert config.rule_by_id("page_back").action["keys"] == ["alt", "left"]
     assert config.rule_by_id("page_forward").action["keys"] == ["alt", "right"]
+    assert config.rule_by_id("refresh").action["keys"] == ["f5"]
     assert config.rule_by_id("tab_next").action["keys"] == ["ctrl", "tab"]
     assert config.rule_by_id("tab_prev").action["keys"] == ["ctrl", "shift", "tab"]
     assert config.rule_by_id("web_play_pause").action["keys"] == ["space"]

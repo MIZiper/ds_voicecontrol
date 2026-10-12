@@ -338,6 +338,15 @@ phrases = ["前进", "下一个页面", "回到刚才那个网页", "前进到�
 type = "hotkey"
 keys = ["alt", "right"]
 
+# 刷新当前页面（浏览器 F5）
+[[rules]]
+id = "refresh"
+name = "刷新页面"
+description = "刷新（重新加载）当前网页，等同于浏览器 F5"
+phrases = ["刷新", "刷新页面", "刷新一下", "重新加载"]
+type = "hotkey"
+keys = ["f5"]
+
 # ---- 网页视频（bilibili / YouTube 等）----
 # 视频还没开始播放时，系统媒体键是无效的（浏览器还没接管媒体会话），这时用空格。
 [[rules]]
